@@ -154,7 +154,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
         return 16
     }()
 
-    // ── Stacked-buffer fused-matmul fast path (env-gated MLX_MOE_STACKED=1) ──
+    // ── Stacked-buffer fused-matmul fast path (default when streaming; MLX_MOE_STACKED=0 disables) ──
     // When enabled, allocate a single stacked weight buffer of shape
     // `[CACHE_SLOTS, intermediate, hidden]` per projection (instead of
     // CACHE_SLOTS individual `[1, intermediate, hidden]` buffers) and
@@ -170,8 +170,8 @@ open class SwitchGLU: Module, @unchecked Sendable {
     //
     // Eligible layers: all 3 projections quantized + SSD streaming
     // resolveable + `idx.size <= 32` (single-token generation). Anything
-    // else falls through to the existing N-buffer path. The flag is
-    // off by default; consumers opt in per launch.
+    // else falls through to the existing N-buffer path. On by default;
+    // MLX_MOE_STACKED=0 restores the legacy N-buffer path.
     private static let syncBeforeMissReads: Bool = {
         let v = ProcessInfo.processInfo.environment["MLX_MOE_MISS_SYNC"] ?? ""
         return v == "1" || v.lowercased() == "true"
@@ -179,7 +179,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
 
     nonisolated(unsafe) package static var useStackedBuffers: Bool = {
         let v = ProcessInfo.processInfo.environment["MLX_MOE_STACKED"] ?? ""
-        return v == "1" || v.lowercased() == "true"
+        return !(v == "0" || v.lowercased() == "false")
     }()
     private var _stackedGate: MLXArray?
     private var _stackedUp: MLXArray?
@@ -525,7 +525,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
             return result.dim(-2) == 1 ? MLX.squeezed(result, axis: -2) : result
         }
 
-        // Stacked-buffer fused-matmul fast path (env-gated MLX_MOE_STACKED=1).
+        // Stacked-buffer fused-matmul fast path (on unless MLX_MOE_STACKED=0).
         // Early-out into the stacked path when applicable; otherwise fall
         // through to the existing SSD-streaming / legacy code below.
         if SwitchGLU.useStackedBuffers,
