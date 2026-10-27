@@ -172,19 +172,21 @@ open class SwitchGLU: Module, @unchecked Sendable {
     // resolveable + `idx.size <= 32` (single-token generation). Anything
     // else falls through to the existing N-buffer path. The flag is
     // off by default; consumers opt in per launch.
-    private static let useStackedBuffers: Bool = {
+    private static let syncBeforeMissReads: Bool = {
+        let v = ProcessInfo.processInfo.environment["MLX_MOE_MISS_SYNC"] ?? ""
+        return v == "1" || v.lowercased() == "true"
+    }()
+
+    nonisolated(unsafe) package static var useStackedBuffers: Bool = {
         let v = ProcessInfo.processInfo.environment["MLX_MOE_STACKED"] ?? ""
         return v == "1" || v.lowercased() == "true"
     }()
     private var _stackedGate: MLXArray?
     private var _stackedUp: MLXArray?
     private var _stackedDown: MLXArray?
-    // Per-slot expert occupant; nil means empty.
-    private var _slotExpert: [Int?]?
-    // Per-slot last-used token counter, used by LRU eviction.
-    private var _slotLastUsed: [Int]?
-    // Per-layer token counter — incremented per fast-path call.
-    private var _tokenCounter: Int = 0
+    // Which expert sits in each stacked slot; created on cold init.
+    private var _slotTable: ExpertSlotTable?
+    private var _streamLayer = -1
     // Bytes per expert slab in a stacked buffer; computed once on cold init.
     private var _stackedBytesPerExpert: Int = 0
     private var _stackedDownBytesPerExpert: Int = 0
@@ -259,9 +261,9 @@ open class SwitchGLU: Module, @unchecked Sendable {
               gateProj is QuantizedSwitchLinear,
               upProj is QuantizedSwitchLinear,
               downProj is QuantizedSwitchLinear,
-              let gateSSD = gateProj.resolveSSDInfo(),
-              let upSSD = upProj.resolveSSDInfo(),
-              let downSSD = downProj.resolveSSDInfo() else {
+              gateProj.resolveSSDInfo() != nil,
+              upProj.resolveSSDInfo() != nil,
+              downProj.resolveSSDInfo() != nil else {
             return nil  // ineligible — fall through to legacy path
         }
 
@@ -269,6 +271,13 @@ open class SwitchGLU: Module, @unchecked Sendable {
         let isFused = SwitchGLU.useFusedGateUp
 
         if _stackedGate == nil && _stackedGateUp == nil {
+            // Each file slab must fill exactly one slot, or reads land in the wrong place.
+            guard let probe = try? makeExpertUnit(0),
+                  zip(probe.extents, [gateProj, upProj, downProj]).allSatisfy({
+                      $0.length == $1.weight.nbytes / $1.weight.dim(0)
+                  }) else {
+                return nil
+            }
             if isFused {
                 // Combined gate+up buffer: shape [CACHE_SLOTS, 2*intermediate, hidden].
                 _stackedGateUp = MLXArray.zeros(
@@ -284,9 +293,6 @@ open class SwitchGLU: Module, @unchecked Sendable {
                         _combinedGateUpBiases = MLX.concatenated([gb, ub], axis: 1)
                     }
                 }
-                _slotExpert = Array(repeating: nil, count: CACHE_SLOTS)
-                _slotLastUsed = Array(repeating: 0, count: CACHE_SLOTS)
-                _tokenCounter = 0
                 var coldEvalList: [MLXArray] = [idx, _stackedGateUp!, _stackedDown!, _combinedGateUpScales!]
                 if let cb = _combinedGateUpBiases { coldEvalList.append(cb) }
                 MLX.eval(coldEvalList)
@@ -303,98 +309,29 @@ open class SwitchGLU: Module, @unchecked Sendable {
                 _stackedDown = MLXArray.zeros(
                     [CACHE_SLOTS, downProj.weight.dim(1), downProj.weight.dim(2)]
                 ).asType(downProj.weight.dtype)
-                _slotExpert = Array(repeating: nil, count: CACHE_SLOTS)
-                _slotLastUsed = Array(repeating: 0, count: CACHE_SLOTS)
-                _tokenCounter = 0
                 MLX.eval([idx, _stackedGate!, _stackedUp!, _stackedDown!])
                 _stackedBytesPerExpert = _stackedGate!.nbytes / CACHE_SLOTS
                 _stackedDownBytesPerExpert = _stackedDown!.nbytes / CACHE_SLOTS
             }
+            _slotTable = ExpertSlotTable(
+                capacity: CACHE_SLOTS, policy: LRUResidencyPolicy(),
+                predictor: PreviousTokenPredictor())
+            _streamLayer = StreamEngine.shared.registerLayer()
         } else {
             // Warm path: kick off GPU work asynchronously while we
             // speculatively prefetch the prev-token's experts. The pread
             // overlaps with the GPU-side resolution of `idx`.
             asyncEval(idx)
         }
-        _tokenCounter += 1
+        let table = _slotTable!
+        table.beginToken()
 
-        // ── Speculative prefetch: pre-load prev-token's experts that are
-        //    NOT already cached, evicting LRU slots and pre-claiming them so
-        //    the current-token resolution sees them as hits. Token-to-token
-        //    expert overlap is high in steady-state generation, so most of
-        //    this work pays off on the same call.
-        var expertToSlotPre = [Int: Int]()
-        for (slot, eid) in _slotExpert!.enumerated() {
-            if let eid = eid { expertToSlotPre[eid] = slot }
-        }
-        func pickPrefetchSlot(excluding claimed: Set<Int>) -> Int {
-            for s in 0..<CACHE_SLOTS {
-                if claimed.contains(s) { continue }
-                if _slotExpert![s] == nil { return s }
-            }
-            var bestSlot = -1, bestTs = Int.max
-            for s in 0..<CACHE_SLOTS {
-                if claimed.contains(s) { continue }
-                if _slotLastUsed![s] < bestTs {
-                    bestTs = _slotLastUsed![s]; bestSlot = s
-                }
-            }
-            return bestSlot
-        }
-        var specTargets: [(slot: Int, expertId: Int)] = []
-        if let prevIds = _previousExpertIds {
-            var specClaimed = Set<Int>()
-            for eid in prevIds {
-                if expertToSlotPre[eid] != nil { continue }  // already cached
-                let slot = pickPrefetchSlot(excluding: specClaimed)
-                if slot < 0 { break }  // shouldn't happen — CACHE_SLOTS > top_k
-                if let old = _slotExpert![slot] { expertToSlotPre.removeValue(forKey: old) }
-                _slotExpert![slot] = eid  // claim slot speculatively
-                expertToSlotPre[eid] = slot
-                specClaimed.insert(slot)
-                specTargets.append((slot, eid))
-            }
-        }
-        if !specTargets.isEmpty {
-            let bpe = _stackedBytesPerExpert
-            let downBpe = _stackedDownBytesPerExpert
-            let errState = ThreadSafeError()
-            DispatchQueue.concurrentPerform(iterations: specTargets.count * 3) { [specTargets] i in
-                errState.catchError {
-                let mIdx = i / 3
-                let proj = i % 3
-                let info = specTargets[mIdx]
-                switch proj {
-                case 0:
-                    let ssd = self.gateProj.resolveSSDInfo(expertIndex: info.expertId) ?? (gateSSD.path, gateSSD.tensorName, UInt32(info.expertId))
-                    if isFused {
-                        // Gate -> first half of slot in combined buffer.
-                        let off = info.slot * 2 * bpe
-                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: ssd.path,
-                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: off)
-                    } else {
-                        MLXFast.preadIntoOffset(self._stackedGate!, safetensorsPath: ssd.path,
-                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * bpe)
-                    }
-                case 1:
-                    let ssd = self.upProj.resolveSSDInfo(expertIndex: info.expertId) ?? (upSSD.path, upSSD.tensorName, UInt32(info.expertId))
-                    if isFused {
-                        // Up -> second half of slot in combined buffer.
-                        let off = info.slot * 2 * bpe + bpe
-                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: ssd.path,
-                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: off)
-                    } else {
-                        MLXFast.preadIntoOffset(self._stackedUp!, safetensorsPath: ssd.path,
-                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * bpe)
-                    }
-                default:
-                    let ssd = self.downProj.resolveSSDInfo(expertIndex: info.expertId) ?? (downSSD.path, downSSD.tensorName, UInt32(info.expertId))
-                    MLXFast.preadIntoOffset(self._stackedDown!, safetensorsPath: ssd.path,
-                                            tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * downBpe)
-                }
-                }
-            }
-            errState.check()
+        // Prefetch predicted experts that are not resident. Token-to-token
+        // expert overlap is high in steady-state generation.
+        let predicted = table.claimPredicted()
+        if !predicted.isEmpty {
+            StreamEngine.shared.read(
+                placementJobs(predicted, isFused: isFused), units: predicted.count, kind: .prefetch)
         }
 
         if idx.size == 0 {
@@ -421,95 +358,22 @@ open class SwitchGLU: Module, @unchecked Sendable {
             startIdx = endIdx
         }
 
-        // ── LRU resolution: route each range to a slot ──
-        var expertToSlot = [Int: Int]()
-        for (slot, eid) in _slotExpert!.enumerated() {
-            if let eid = eid { expertToSlot[eid] = slot }
-        }
-        func pickEvictionSlot(excluding claimed: Set<Int>) -> Int {
-            for s in 0..<CACHE_SLOTS {
-                if claimed.contains(s) { continue }
-                if _slotExpert![s] == nil { return s }
-            }
-            var bestSlot = -1, bestTs = Int.max
-            for s in 0..<CACHE_SLOTS {
-                if claimed.contains(s) { continue }
-                if _slotLastUsed![s] < bestTs {
-                    bestTs = _slotLastUsed![s]; bestSlot = s
-                }
-            }
-            return bestSlot
-        }
-        var slotForRange: [Int] = []
-        var missesNeedingPread: [(slot: Int, expertId: Int)] = []
-        var claimedSlots = Set<Int>()
-        for r in ranges {
-            if let slot = expertToSlot[r.id], !claimedSlots.contains(slot) {
-                slotForRange.append(slot)
-                claimedSlots.insert(slot)
-                _slotLastUsed![slot] = _tokenCounter
-            } else {
-                let slot = pickEvictionSlot(excluding: claimedSlots)
-                if slot < 0 { return nil }  // no slot available; fall back
-                if let old = _slotExpert![slot] { expertToSlot.removeValue(forKey: old) }
-                _slotExpert![slot] = r.id
-                expertToSlot[r.id] = slot
-                _slotLastUsed![slot] = _tokenCounter
-                claimedSlots.insert(slot)
-                slotForRange.append(slot)
-                missesNeedingPread.append((slot, r.id))
-            }
-        }
+        guard let resolution = table.resolve(ranges.map { $0.id }) else { return nil }
+        let slotForRange = resolution.slots
+        StreamEngine.shared.recordResolution(
+            hits: ranges.count - resolution.misses.count, misses: resolution.misses.count)
 
-        // ── Pread misses into stacked-buffer slots ──
-        if !missesNeedingPread.isEmpty {
-            let bpe = _stackedBytesPerExpert
-            let downBpe = _stackedDownBytesPerExpert
-            
-            // SYNCHRONIZATION POINT
-            // Ensure the GPU has finished reading the stacked buffers from the previous token's
-            // computeExpertsFused before we overwrite those slots with new expert weights from the SSD.
-            Stream.gpu.synchronize()
-            print("[SwitchLayers] SSD Sync: GPU drained. Misses=\(missesNeedingPread.count)")
-            fflush(stdout)
-            
-            let errState = ThreadSafeError()
-            DispatchQueue.concurrentPerform(iterations: missesNeedingPread.count * 3) { [missesNeedingPread] i in
-                errState.catchError {
-                let mIdx = i / 3
-                let proj = i % 3
-                let info = missesNeedingPread[mIdx]
-                switch proj {
-                case 0:
-                    let ssd = self.gateProj.resolveSSDInfo(expertIndex: info.expertId) ?? (gateSSD.path, gateSSD.tensorName, UInt32(info.expertId))
-                    if isFused {
-                        let off = info.slot * 2 * bpe
-                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: ssd.path,
-                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: off)
-                    } else {
-                        MLXFast.preadIntoOffset(self._stackedGate!, safetensorsPath: ssd.path,
-                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * bpe)
-                    }
-                case 1:
-                    let ssd = self.upProj.resolveSSDInfo(expertIndex: info.expertId) ?? (upSSD.path, upSSD.tensorName, UInt32(info.expertId))
-                    if isFused {
-                        let off = info.slot * 2 * bpe + bpe
-                        MLXFast.preadIntoOffset(self._stackedGateUp!, safetensorsPath: ssd.path,
-                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: off)
-                    } else {
-                        MLXFast.preadIntoOffset(self._stackedUp!, safetensorsPath: ssd.path,
-                                                tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * bpe)
-                    }
-                default:
-                    let ssd = self.downProj.resolveSSDInfo(expertIndex: info.expertId) ?? (downSSD.path, downSSD.tensorName, UInt32(info.expertId))
-                    MLXFast.preadIntoOffset(self._stackedDown!, safetensorsPath: ssd.path,
-                                            tensorName: ssd.tensorName, expertIndex: ssd.readIndex, dstOffset: info.slot * downBpe)
-                }
-                }
+        if !resolution.misses.isEmpty {
+            // The idx readback above already waited for every earlier use of these slots:
+            // this token's routing depends on all layers of the previous token.
+            // MLX_MOE_MISS_SYNC=1 drains the GPU anyway, for graphs outside that chain.
+            if SwitchGLU.syncBeforeMissReads {
+                Stream.gpu.synchronize()
             }
-            errState.check()
+            StreamEngine.shared.read(
+                placementJobs(resolution.misses, isFused: isFused),
+                units: resolution.misses.count, kind: .miss)
         }
-        _previousExpertIds = ranges.map { $0.id }
 
         // ── Build slotPerToken + slotExperts arrays for fused compute ──
         var slotPerTokenArr = [Int32](repeating: 0, count: cpuIndices.count)
@@ -518,7 +382,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
             for t in r.start..<r.end { slotPerTokenArr[t] = s }
         }
         let slotPerToken = MLXArray(slotPerTokenArr).asType(.uint32)
-        let slotExperts = _slotExpert!.map { Int32($0 ?? 0) }
+        let slotExperts = table.occupant.map { Int32($0 ?? 0) }
 
         // ── Fused compute: ONE gatherQuantizedMM per projection ──
         let intermediate: MLXArray
@@ -544,6 +408,43 @@ open class SwitchGLU: Module, @unchecked Sendable {
             return MLX.squeezed(scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape), axis: -2)
         }
         return MLX.squeezed(x, axis: -2)
+    }
+
+    /// One expert's gate, up and down weight extents.
+    private func makeExpertUnit(_ expert: Int) throws -> StreamableUnit {
+        StreamableUnit(
+            id: UnitID(layer: _streamLayer, expert: expert),
+            extents: try [gateProj, upProj, downProj].map { try $0.ssdExtent(expertIndex: expert) })
+    }
+
+    /// Reads that place each expert's weights into its stacked slot, in gate, up,
+    /// down order. Fused mode puts gate then up in one combined slot.
+    private func placementJobs(_ placements: [(slot: Int, expert: Int)], isFused: Bool) -> [ReadJob] {
+        let bpe = _stackedBytesPerExpert
+        let downBpe = _stackedDownBytesPerExpert
+        var jobs = [ReadJob]()
+        jobs.reserveCapacity(placements.count * 3)
+        for p in placements {
+            let unit: StreamableUnit
+            do {
+                unit = try makeExpertUnit(p.expert)
+            } catch {
+                let streamingError = SSDStreamingError(underlyingError: error)
+                SSDStreamingErrorLatch.active?.set(streamingError)
+                SSDStreamingErrorLatch.shared.set(streamingError)
+                continue
+            }
+            let (gate, up, down) = (unit.extents[0], unit.extents[1], unit.extents[2])
+            if isFused {
+                jobs.append(ReadJob(dst: _stackedGateUp!, dstOffset: p.slot * 2 * bpe, extent: gate))
+                jobs.append(ReadJob(dst: _stackedGateUp!, dstOffset: p.slot * 2 * bpe + bpe, extent: up))
+            } else {
+                jobs.append(ReadJob(dst: _stackedGate!, dstOffset: p.slot * bpe, extent: gate))
+                jobs.append(ReadJob(dst: _stackedUp!, dstOffset: p.slot * bpe, extent: up))
+            }
+            jobs.append(ReadJob(dst: _stackedDown!, dstOffset: p.slot * downBpe, extent: down))
+        }
+        return jobs
     }
 
     /// Single fused `gatherQuantizedMM` over the combined `_stackedGateUp`
@@ -1311,6 +1212,19 @@ open class SwitchLinear: Module, Quantizable {
         #else
         return nil
         #endif
+    }
+
+    /// File extent of one expert's weight, with the same offsets `MLXFast.preadInto` uses.
+    public func ssdExtent(expertIndex: Int) throws -> UnitExtent {
+        guard let ssd = resolveSSDInfo(expertIndex: expertIndex) else {
+            throw SafetensorsLayoutError(description: "no SSD source for expert \(expertIndex)")
+        }
+        let tensor = try SafetensorsLayout.shared.tensor(ssd.tensorName, in: ssd.path)
+        guard let extent = tensor.slab(Int(ssd.readIndex), path: ssd.path) else {
+            throw SafetensorsLayoutError(
+                description: "expert \(ssd.readIndex) out of range for \(ssd.tensorName)")
+        }
+        return extent
     }
 
     public init(inputDims: Int, outputDims: Int, numExperts: Int, bias: Bool = true) {

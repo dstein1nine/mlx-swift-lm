@@ -114,7 +114,13 @@ final class SSDPersistentBufferReproTests: XCTestCase {
 
     /// Runs `calls` through the SSD streaming path and compares every output with the
     /// in-memory reference computed by the same checkpoint without streaming.
-    private func runAgainstReference(_ calls: [[[UInt32]]], file: StaticString = #filePath, line: UInt = #line) throws {
+    private func runAgainstReference(
+        _ calls: [[[UInt32]]], stacked: Bool = false,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let savedStacked = SwitchGLU.useStackedBuffers
+        SwitchGLU.useStackedBuffers = stacked
+        defer { SwitchGLU.useStackedBuffers = savedStacked }
         let inputs = calls.enumerated().map { makeInputs($0.element, seed: UInt64(100 + $0.offset)) }
 
         // Reference: streaming off, experts resident, plain gatherQuantizedMM.
@@ -204,5 +210,29 @@ final class SSDPersistentBufferReproTests: XCTestCase {
             [[10, 11, 12, 13, 14, 15, 20, 21], [22, 23, 24, 25, 26, 27, 28, 29]],  // hits 10..15 stay in slots 10..15
             [[24, 25, 26, 27, 28, 29, 22, 23]],  // prev ids map 24..29 -> slots 10..15, which hold experts 10..15
         ])
+    }
+
+    func testStackedPathMatchesReference() throws {
+        try runAgainstReference([
+            [[0, 1, 2, 3, 4, 5, 6, 7]],
+            [[0, 2, 4, 6, 8, 10, 12, 14]],  // half hits, half misses
+            [[1, 3, 16, 17, 24, 25, 30, 31]],
+            [[0, 2, 4, 6, 8, 10, 12, 14], [16, 17, 18, 19, 20, 21, 22, 23]],  // 16 distinct: fills every slot
+            [[3, 7, 11, 15, 19, 23, 27, 31]],
+        ], stacked: true)
+    }
+
+    /// A verify step that routes to more distinct experts than the stacked path has
+    /// slots falls back to the legacy path. The slot table must be left as it was:
+    /// before the fix, slots 0..<16 were renamed to experts 8..<24 without being read,
+    /// and the next decode call computed with zeros or another expert's weights.
+    func testStackedSlotExhaustionLeavesSlotsUntouched() throws {
+        try runAgainstReference([
+            [[0, 1, 2, 3, 4, 5, 6, 7]],
+            [[8, 9, 10, 11, 12, 13, 14, 15], [16, 17, 18, 19, 20, 21, 22, 23],
+             [24, 25, 26, 27, 28, 29, 30, 31]],  // 24 distinct > 16 slots: legacy fallback
+            [[8, 9, 10, 11, 12, 13, 14, 15]],
+            [[16, 17, 18, 19, 20, 21, 22, 23]],
+        ], stacked: true)
     }
 }
