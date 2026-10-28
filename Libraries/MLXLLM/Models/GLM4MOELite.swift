@@ -11,117 +11,6 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// MARK: - MultiLinear
-
-class MultiLinear: Module, Quantizable {
-    let inputDims: Int
-    let outputDims: Int
-    let numHeads: Int
-
-    @ParameterInfo(key: "weight") var weight: MLXArray
-
-    init(inputDims: Int, outputDims: Int, numHeads: Int) {
-        self.inputDims = inputDims
-        self.outputDims = outputDims
-        self.numHeads = numHeads
-
-        let scale = sqrt(1.0 / Float(inputDims))
-        _weight.wrappedValue = MLXRandom.uniform(
-            low: -scale,
-            high: scale,
-            [numHeads, outputDims, inputDims]
-        )
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        return x.matmul(weight.swappedAxes(-1, -2))
-    }
-
-    // MARK: - Quantizable conformance
-
-    public func toQuantized(groupSize: Int, bits: Int, mode: QuantizationMode) -> Module {
-        return QuantizedMultiLinear(
-            weight: weight,
-            groupSize: groupSize,
-            bits: bits,
-            mode: mode
-        )
-    }
-}
-
-// MARK: - QuantizedMultiLinear
-
-/// Quantized version of MultiLinear that handles packed 4-bit weights.
-/// This is the Swift equivalent of Python's QuantizedMultiLinear class (lines 89-129 in glm4_moe_lite.py).
-class QuantizedMultiLinear: Module, Quantized {
-    public let groupSize: Int
-    public let bits: Int
-    public let mode: QuantizationMode
-
-    @ParameterInfo(key: "weight") var weight: MLXArray
-    @ParameterInfo(key: "scales") var scales: MLXArray
-    @ParameterInfo(key: "biases") var biases: MLXArray?
-
-    /// Initialize from non-quantized weights (for conversion from MultiLinear)
-    init(
-        weight: MLXArray,
-        groupSize: Int,
-        bits: Int,
-        mode: QuantizationMode = .affine
-    ) {
-        self.groupSize = groupSize
-        self.bits = bits
-        self.mode = mode
-
-        let (quantizedWeight, scales, biases) = MLX.quantized(
-            weight, groupSize: groupSize, bits: bits, mode: mode
-        )
-        _weight.wrappedValue = quantizedWeight
-        _scales.wrappedValue = scales
-        _biases.wrappedValue = biases
-
-        super.init()
-        self.freeze()
-    }
-
-    /// Initialize with pre-quantized weights and scales (for loading from file)
-    init(
-        weight: MLXArray,
-        scales: MLXArray,
-        biases: MLXArray?,
-        groupSize: Int,
-        bits: Int,
-        mode: QuantizationMode = .affine
-    ) {
-        self.groupSize = groupSize
-        self.bits = bits
-        self.mode = mode
-
-        _weight.wrappedValue = weight
-        _scales.wrappedValue = scales
-        _biases.wrappedValue = biases
-
-        super.init()
-        self.freeze()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // Use quantizedMM for efficient quantized matrix multiplication
-        // The weight is in shape [numHeads, outputDims, inputDims(packed)]
-        return quantizedMM(
-            x,
-            weight,
-            scales: scales,
-            biases: biases,
-            transpose: true,
-            groupSize: groupSize,
-            bits: bits,
-            mode: mode
-        )
-    }
-}
-
 // MARK: - Attention
 
 class GLM4MoELiteAttention: Module {
@@ -146,8 +35,8 @@ class GLM4MoELiteAttention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "kv_a_proj_with_mqa") var kvAProjWithMqa: Linear
     @ModuleInfo(key: "kv_a_layernorm") var kvALayerNorm: RMSNorm
-    @ModuleInfo(key: "embed_q") var embedQ: Module  // Can be MultiLinear or QuantizedMultiLinear
-    @ModuleInfo(key: "unembed_out") var unembedOut: Module  // Can be MultiLinear or QuantizedMultiLinear
+    @ModuleInfo(key: "embed_q") var embedQ: MultiLinear
+    @ModuleInfo(key: "unembed_out") var unembedOut: MultiLinear
 
     init(_ config: GLM4MoELiteConfiguration) {
         self.config = config
@@ -219,17 +108,6 @@ class GLM4MoELiteAttention: Module {
         )
     }
 
-    /// Helper to call a MultiLinear or QuantizedMultiLinear module
-    private func callMultiLinear(_ module: Module, _ x: MLXArray) -> MLXArray {
-        if let multiLinear = module as? MultiLinear {
-            return multiLinear(x)
-        } else if let quantized = module as? QuantizedMultiLinear {
-            return quantized(x)
-        } else {
-            fatalError("Module must be MultiLinear or QuantizedMultiLinear")
-        }
-    }
-
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
@@ -262,7 +140,7 @@ class GLM4MoELiteAttention: Module {
         kvLatent = expandedDimensions(kvLatent, axis: 1)
 
         // Transform q_nope through embed_q
-        qNope = callMultiLinear(embedQ, qNope)
+        qNope = embedQ(qNope)
 
         // Keys carry [kvLatent, kPe]; values carry only the compressed KV latent.
         let keys = concatenated([kvLatent, kPe], axis: -1)
@@ -279,7 +157,7 @@ class GLM4MoELiteAttention: Module {
         )
 
         // Transform output through unembed_out
-        output = callMultiLinear(unembedOut, output)
+        output = unembedOut(output)
 
         output = output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         return oProj(output)
@@ -450,7 +328,7 @@ public class GLM4MoELiteModelInner: Module, LayerPartitionable, StreamableMoE {
 
     let layers: [GLM4MoELiteDecoderLayer]
     let norm: RMSNorm
-    
+
     public var gpuLayerCount: Int? = nil
     public var streamExperts: Bool = false
     public var totalLayerCount: Int { layers.count }
@@ -474,7 +352,8 @@ public class GLM4MoELiteModelInner: Module, LayerPartitionable, StreamableMoE {
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
-            h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts) {
+            h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts)
+            {
                 layer(h, mask: mask, cache: cache?[i])
             }
         }

@@ -16,43 +16,43 @@ struct DeepseekV32Tests {
         numHiddenLayers: Int = 4, indexTopk: Int = 2048
     ) -> Data {
         let json = """
-        {
-            "model_type": "glm_moe_dsa",
-            "architectures": ["GlmMoeDsaForCausalLM"],
-            "vocab_size": 128,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "moe_intermediate_size": 32,
-            "num_hidden_layers": \(numHiddenLayers),
-            "num_attention_heads": 4,
-            "num_key_value_heads": 4,
-            "n_shared_experts": 1,
-            "n_routed_experts": 4,
-            "routed_scaling_factor": 2.5,
-            "kv_lora_rank": 16,
-            "q_lora_rank": 32,
-            "qk_rope_head_dim": 8,
-            "v_head_dim": 16,
-            "qk_nope_head_dim": 16,
-            "norm_topk_prob": true,
-            "n_group": 1,
-            "topk_group": 1,
-            "num_experts_per_tok": 2,
-            "moe_layer_freq": 1,
-            "first_k_dense_replace": 1,
-            "max_position_embeddings": 1048576,
-            "rms_norm_eps": 1e-05,
-            "rope_parameters": {"rope_theta": 8000000, "rope_type": "default"},
-            "attention_bias": false,
-            "scoring_func": "sigmoid",
-            "topk_method": "noaux_tc",
-            "index_topk": \(indexTopk),
-            "index_n_heads": 32,
-            "index_head_dim": 128,
-            "indexer_rope_interleave": true,
-            "num_nextn_predict_layers": 1
-        }
-        """
+            {
+                "model_type": "glm_moe_dsa",
+                "architectures": ["GlmMoeDsaForCausalLM"],
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": \(numHiddenLayers),
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "routed_scaling_factor": 2.5,
+                "kv_lora_rank": 16,
+                "q_lora_rank": 32,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 16,
+                "qk_nope_head_dim": 16,
+                "norm_topk_prob": true,
+                "n_group": 1,
+                "topk_group": 1,
+                "num_experts_per_tok": 2,
+                "moe_layer_freq": 1,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 1048576,
+                "rms_norm_eps": 1e-05,
+                "rope_parameters": {"rope_theta": 8000000, "rope_type": "default"},
+                "attention_bias": false,
+                "scoring_func": "sigmoid",
+                "topk_method": "noaux_tc",
+                "index_topk": \(indexTopk),
+                "index_n_heads": 32,
+                "index_head_dim": 128,
+                "indexer_rope_interleave": true,
+                "num_nextn_predict_layers": 1
+            }
+            """
         return json.data(using: .utf8)!
     }
 
@@ -316,5 +316,160 @@ struct DeepseekV32Tests {
 
         #expect(sanitized.keys.contains("model.layers.60.self_attn.q_a_proj.weight"))
         #expect(!sanitized.keys.contains("model.layers.61.self_attn.q_a_proj.weight"))
+    }
+
+    // MARK: - GLM-5.3: absorbed attention weights, shared-indexer layers
+
+    private func configData(overrides: [String: Any], base: Data? = nil) throws -> Data {
+        var json =
+            try JSONSerialization.jsonObject(with: base ?? glmStyleConfigData()) as! [String: Any]
+        for (k, v) in overrides { json[k] = v }
+        return try JSONSerialization.data(withJSONObject: json)
+    }
+
+    @Test("indexer_types: explicit list, pattern string, or the freq/offset formula")
+    func testIndexerTypesResolution() throws {
+        let formula = try JSONDecoder().decode(
+            DeepseekV32Configuration.self,
+            from: configData(overrides: [
+                "num_hidden_layers": 12, "index_topk_freq": 4, "index_skip_topk_offset": 3,
+            ]))
+        #expect(
+            formula.indexerTypes == [
+                "full", "full", "full", "shared", "shared", "shared", "full", "shared", "shared",
+                "shared", "full", "shared",
+            ])
+
+        let explicit = try JSONDecoder().decode(
+            DeepseekV32Configuration.self,
+            from: configData(overrides: [
+                "index_topk_freq": 4, "indexer_types": ["full", "shared", "shared", "full"],
+            ]))
+        #expect(explicit.indexerTypes == ["full", "shared", "shared", "full"])
+
+        let pattern = try JSONDecoder().decode(
+            DeepseekV32Configuration.self,
+            from: configData(overrides: ["index_topk_pattern": "FSSF"]))
+        #expect(pattern.indexerTypes == ["full", "shared", "shared", "full"])
+
+        // No GLM keys at all: every layer runs its own indexer.
+        let plain = try JSONDecoder().decode(
+            DeepseekV32Configuration.self, from: glmStyleConfigData())
+        #expect(plain.indexerTypes == Array(repeating: "full", count: 4))
+    }
+
+    @Test("Shared layers have no indexer and a single cache; full layers have both")
+    func testSharedLayersSkipIndexer() throws {
+        let cfg = try JSONDecoder().decode(
+            DeepseekV32Configuration.self,
+            from: configData(overrides: [
+                "indexer_types": ["full", "shared", "shared", "full"], "index_topk": 4,
+            ]))
+        let model = DeepseekV32Model(cfg)
+
+        #expect(model.model.layers[0].selfAttn.indexer != nil)
+        #expect(model.model.layers[1].selfAttn.indexer == nil)
+        #expect(model.model.layers[2].selfAttn.indexer == nil)
+        #expect(model.model.layers[3].selfAttn.indexer != nil)
+
+        let caches = model.newCache(parameters: nil).map { ($0 as! CacheList).count }
+        #expect(caches == [2, 1, 1, 2])
+
+        // Past index_topk the shared layers reuse layer 0's selection.
+        let cache = model.newCache(parameters: nil)
+        let prefill = model(MLXArray(0 ..< 6).reshaped(1, 6), cache: cache)
+        let decode = model(MLXArray([6]).reshaped(1, 1), cache: cache)
+        eval(prefill, decode)
+        #expect(prefill.shape == [1, 6, 128])
+        #expect(decode.shape == [1, 1, 128])
+        #expect(!prefill.sum().item(Float.self).isNaN)
+        #expect(!decode.sum().item(Float.self).isNaN)
+    }
+
+    /// Decode uses the absorbed path (query lifted into latent space, selected
+    /// latents gathered); prefill expands the latents into per-head K/V and masks.
+    /// Both must agree with a single prefill over the whole sequence.
+    @Test(
+        "Decode step matches the same position from a one-shot prefill", arguments: [1_000_000, 4])
+    func testDecodeMatchesPrefill(indexTopk: Int) throws {
+        let cfg = try JSONDecoder().decode(
+            DeepseekV32Configuration.self,
+            from: configData(overrides: [
+                "indexer_types": ["full", "shared", "full", "shared"], "index_topk": indexTopk,
+            ]))
+        let model = DeepseekV32Model(cfg)
+        let tokens = MLXArray(0 ..< 7).reshaped(1, 7)
+
+        let oneShot = model(tokens, cache: nil)[0..., 6, 0...]
+
+        let cache = model.newCache(parameters: nil)
+        _ = model(tokens[0..., ..<6], cache: cache)
+        let stepped = model(tokens[0..., 6...], cache: cache)[0..., 0, 0...]
+        eval(oneShot, stepped)
+
+        let maxAbsDiff = (oneShot - stepped).abs().max().item(Float.self)
+        let scale = oneShot.abs().max().item(Float.self)
+        #expect(maxAbsDiff <= 1e-3 * max(scale, 1), "decode/prefill mismatch \(maxAbsDiff)")
+    }
+
+    @Test("sanitize splits kv_b_proj into per-head embed_q / unembed_out")
+    func testSanitizeSplitsKvBProj() throws {
+        let cfg = try JSONDecoder().decode(
+            DeepseekV32Configuration.self, from: glmStyleConfigData(numHiddenLayers: 1))
+        let model = DeepseekV32Model(cfg)
+        let (heads, nope, v, rank) = (4, 16, 16, 16)
+        let kvB = MLXRandom.normal([heads * (nope + v), rank])
+
+        let out = model.sanitize(weights: ["model.layers.0.self_attn.kv_b_proj.weight": kvB])
+        #expect(out["model.layers.0.self_attn.kv_b_proj.weight"] == nil)
+        let embedQ = try #require(out["model.layers.0.self_attn.embed_q.weight"])
+        let unembedOut = try #require(out["model.layers.0.self_attn.unembed_out.weight"])
+        #expect(embedQ.shape == [heads, rank, nope])
+        #expect(unembedOut.shape == [heads, v, rank])
+
+        let perHead = kvB.reshaped(heads, nope + v, rank)
+        let expectedK = perHead[0..., ..<nope, 0...].swappedAxes(-1, -2)
+        let expectedV = perHead[0..., nope..., 0...]
+        #expect((embedQ - expectedK).abs().max().item(Float.self) == 0)
+        #expect((unembedOut - expectedV).abs().max().item(Float.self) == 0)
+    }
+
+    @Test("sanitize re-quantizes a quantized kv_b_proj")
+    func testSanitizeSplitsQuantizedKvBProj() throws {
+        let (heads, nope, v, rank, group, bits) = (4, 32, 32, 64, 32, 4)
+        let cfg = try JSONDecoder().decode(
+            DeepseekV32Configuration.self,
+            from: configData(overrides: [
+                "num_hidden_layers": 1, "kv_lora_rank": rank, "qk_nope_head_dim": nope,
+                "v_head_dim": v,
+            ]))
+        let model = DeepseekV32Model(cfg)
+        let kvB = MLXRandom.normal([heads * (nope + v), rank])
+        let (wq, scales, biases) = quantized(kvB, groupSize: group, bits: bits)
+
+        let out = model.sanitize(weights: [
+            "model.layers.0.self_attn.kv_b_proj.weight": wq,
+            "model.layers.0.self_attn.kv_b_proj.scales": scales,
+            "model.layers.0.self_attn.kv_b_proj.biases": biases!,
+        ])
+        #expect(out.keys.filter { $0.contains("kv_b_proj") }.isEmpty)
+        let embedQ = try #require(out["model.layers.0.self_attn.embed_q.weight"])
+        let embedQScales = try #require(out["model.layers.0.self_attn.embed_q.scales"])
+        let embedQBiases = try #require(out["model.layers.0.self_attn.embed_q.biases"])
+        #expect(embedQ.shape == [heads, rank, nope * bits / 32])
+        #expect(embedQScales.shape == [heads, rank, nope / group])
+        #expect(
+            out["model.layers.0.self_attn.unembed_out.weight"]?.shape == [
+                heads, v, rank * bits / 32,
+            ])
+
+        let restored = dequantized(
+            embedQ, scales: embedQScales, biases: embedQBiases, groupSize: group, bits: bits)
+        let expectedK = dequantized(
+            wq, scales: scales, biases: biases, groupSize: group, bits: bits
+        )
+        .reshaped(heads, nope + v, rank)[0..., ..<nope, 0...].swappedAxes(-1, -2)
+        eval(restored, expectedK)
+        #expect((restored - expectedK).abs().max().item(Float.self) < 0.5)
     }
 }

@@ -20,17 +20,14 @@
 // weights. Past `index_topk` (2048 for GLM-5.2), attention is restricted to the
 // indexer's top-k selection.
 //
-// Absorbed-MLA note: the Python reference's `DeepseekV32Attention` decode path
-// gathers only the selected latent/rope entries (`take_along_axis`) because it
-// keeps K/V in absorbed per-token latent form until attention time. This port's
-// `DeepseekV3Attention`-derived structure materialises full per-head K/V before
-// attention (same as stage 1, same as plain V3), so instead of gathering, the
-// top-k selection is applied as a boolean mask ANDed with the causal mask —
-// masking out non-selected positions in a full attend-over-everything SDPA call
-// is numerically identical to attending only over the gathered subset, just
-// without the compute/memory saving of not materialising the excluded K/V. This
-// also means one code path (not separate prefill/decode paths) is correct for
-// both, which is what the tests below check.
+// Absorbed-MLA: K/V are cached in latent form (`kv_lora_rank` + `qk_rope_head_dim`
+// per token, one head). `embed_q` / `unembed_out` hold the per-head halves of
+// `kv_b_proj`; decode lifts the query into latent space and gathers only the
+// indexer's selected positions, prefill expands the latents back into per-head
+// K/V and masks. GLM-5.3 ships the weights in this layout and skips the indexer
+// on its "shared" layers, which reuse the previous layer's top-k selection.
+// Checkpoints that still carry `kv_b_proj` (GLM-5.2, DeepSeek V3.2) are converted
+// in `sanitize`. The blocked sparse-prefill path of the reference is not ported.
 
 import Foundation
 import MLX
@@ -79,6 +76,10 @@ public struct DeepseekV32Configuration: Codable, Sendable {
     /// builds with `traditional: true` regardless of this field.
     var indexerRopeInterleave: Bool
     var numNextnPredictLayers: Int
+    /// Per-layer "full" (own indexer) or "shared" (reuse the previous layer's top-k).
+    var indexerTypes: [String]
+    var indexTopkFreq: Int
+    var indexSkipTopkOffset: Int
 
     enum CodingKeys: String, CodingKey {
         case vocabSize = "vocab_size"
@@ -113,6 +114,14 @@ public struct DeepseekV32Configuration: Codable, Sendable {
         case indexHeadDim = "index_head_dim"
         case indexerRopeInterleave = "indexer_rope_interleave"
         case numNextnPredictLayers = "num_nextn_predict_layers"
+        case indexerTypes = "indexer_types"
+        case indexTopkFreq = "index_topk_freq"
+        case indexSkipTopkOffset = "index_skip_topk_offset"
+    }
+
+    /// `index_topk_pattern` is read-only input: it is folded into `indexerTypes`.
+    private enum PatternKeys: String, CodingKey {
+        case indexTopkPattern = "index_topk_pattern"
     }
 
     public init(from decoder: Decoder) throws {
@@ -152,6 +161,30 @@ public struct DeepseekV32Configuration: Codable, Sendable {
             try c.decodeIfPresent(Bool.self, forKey: .indexerRopeInterleave) ?? true
         numNextnPredictLayers =
             try c.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers) ?? 0
+
+        // Mirrors glm_moe_dsa.ModelArgs.__post_init__: explicit list, then pattern
+        // string ("F"/"S") or list, then the freq/offset formula. DeepSeek V3.2
+        // configs have none of these and resolve to all "full".
+        indexTopkFreq = max(try c.decodeIfPresent(Int.self, forKey: .indexTopkFreq) ?? 1, 1)
+        indexSkipTopkOffset = try c.decodeIfPresent(Int.self, forKey: .indexSkipTopkOffset) ?? 2
+        let patterns = try decoder.container(keyedBy: PatternKeys.self)
+        if let explicit = try c.decodeIfPresent([String].self, forKey: .indexerTypes) {
+            indexerTypes = explicit
+        } else if let pattern = try? patterns.decodeIfPresent(
+            String.self, forKey: .indexTopkPattern)
+        {
+            indexerTypes = pattern.map { $0 == "S" ? "shared" : "full" }
+        } else if let pattern = try? patterns.decodeIfPresent(
+            [String].self, forKey: .indexTopkPattern)
+        {
+            indexerTypes = pattern
+        } else {
+            let freq = indexTopkFreq
+            let offset = indexSkipTopkOffset
+            indexerTypes = (0 ..< numHiddenLayers).map {
+                max($0 - offset + 1, 0) % freq == 0 ? "full" : "shared"
+            }
+        }
 
         // GLM-5.2 carries no top-level `rope_theta`/`rope_scaling`; both live inside a
         // `rope_parameters` dict, which mlx-lm unpacks in ModelArgs.__post_init__.
@@ -314,12 +347,8 @@ class DeepseekV32Indexer: Module {
     }
 }
 
-/// `DeepseekV3Attention` plus the DSA indexer. The Q/KV projections are an exact
-/// duplicate of `DeepseekV3Attention` (same weight keys, same shapes — the
-/// checkpoint's main-attention weights are unchanged by DSA); the only new
-/// sub-module is `indexer`, and the only behavioral change is building a
-/// top-k-restricted mask before the existing attention call. See the file header
-/// for why this is a boolean mask rather than the reference's absorbed-MLA gather.
+/// Absorbed-MLA attention with the DSA indexer. Port of
+/// `glm_moe_dsa.GlmMoeDsaAttention` over `deepseek_v32.DeepseekV32Attention`.
 class DeepseekV32Attention: Module {
     let qkRopeHeadDim: Int
     let kvLoraRank: Int
@@ -328,19 +357,21 @@ class DeepseekV32Attention: Module {
     let qHeadDim: Int
     let numHeads: Int
     var scale: Float
+    /// "shared" layers have no indexer and reuse the previous layer's selection.
+    let skipTopk: Bool
 
     let rope: RoPELayer
-    @ModuleInfo(key: "q_proj") var qProj: Linear?
-    @ModuleInfo(key: "q_a_proj") var qAProj: Linear?
-    @ModuleInfo(key: "q_a_layernorm") var qALayerNorm: RMSNorm?
-    @ModuleInfo(key: "q_b_proj") var qBProj: Linear?
+    @ModuleInfo(key: "q_a_proj") var qAProj: Linear
+    @ModuleInfo(key: "q_a_layernorm") var qALayerNorm: RMSNorm
+    @ModuleInfo(key: "q_b_proj") var qBProj: Linear
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "kv_a_proj_with_mqa") var kvAProjWithMqa: Linear
     @ModuleInfo(key: "kv_a_layernorm") var kvALayerNorm: RMSNorm
-    @ModuleInfo(key: "kv_b_proj") var kvBProj: Linear
-    @ModuleInfo(key: "indexer") var indexer: DeepseekV32Indexer
+    @ModuleInfo(key: "embed_q") var embedQ: MultiLinear
+    @ModuleInfo(key: "unembed_out") var unembedOut: MultiLinear
+    @ModuleInfo(key: "indexer") var indexer: DeepseekV32Indexer?
 
-    init(_ args: DeepseekV32Configuration) {
+    init(_ args: DeepseekV32Configuration, layerIdx: Int) {
         let hiddenSize = args.hiddenSize
         self.numHeads = args.numAttentionHeads
         self.qkRopeHeadDim = args.qkRopeHeadDim
@@ -349,6 +380,8 @@ class DeepseekV32Attention: Module {
         self.qkNopeHeadDim = args.qkNopeHeadDim
         self.qHeadDim = args.qkNopeHeadDim + args.qkRopeHeadDim
         self.scale = pow(Float(qHeadDim), -0.5)
+        self.skipTopk =
+            layerIdx < args.indexerTypes.count && args.indexerTypes[layerIdx] == "shared"
 
         let qLoraRank = args.qLoraRank
         self._qAProj.wrappedValue = Linear(hiddenSize, qLoraRank, bias: args.attentionBias)
@@ -358,8 +391,10 @@ class DeepseekV32Attention: Module {
         self._kvAProjWithMqa.wrappedValue = Linear(
             hiddenSize, kvLoraRank + qkRopeHeadDim, bias: args.attentionBias)
         self._kvALayerNorm.wrappedValue = RMSNorm(dimensions: kvLoraRank)
-        self._kvBProj.wrappedValue = Linear(
-            kvLoraRank, numHeads * (qHeadDim - qkRopeHeadDim + vHeadDim), bias: false)
+        self._embedQ.wrappedValue = MultiLinear(
+            inputDims: qkNopeHeadDim, outputDims: kvLoraRank, numHeads: numHeads)
+        self._unembedOut.wrappedValue = MultiLinear(
+            inputDims: kvLoraRank, outputDims: vHeadDim, numHeads: numHeads)
         self._oProj.wrappedValue = Linear(numHeads * vHeadDim, hiddenSize, bias: args.attentionBias)
 
         if let ropeScaling = args.ropeScaling {
@@ -376,110 +411,115 @@ class DeepseekV32Attention: Module {
         self.rope = initializeRope(
             dims: qkRopeHeadDim, base: args.ropeTheta, traditional: true,
             scalingConfig: args.ropeScaling, maxPositionEmbeddings: args.maxPositionEmbeddings)
-        self._indexer.wrappedValue = DeepseekV32Indexer(args)
+        self._indexer.wrappedValue = skipTopk ? nil : DeepseekV32Indexer(args)
     }
 
+    /// - Parameters:
+    ///   - mask: boolean causal mask `[B, 1, L, S]` for prefill, `nil` for decode.
+    ///   - cache: `CacheList(main)` for shared layers, `CacheList(main, indexer)` otherwise.
+    ///   - prevTopkIndices: the previous layer's selection, used when `skipTopk`.
+    /// - Returns: the attention output and this layer's top-k selection (or `nil`).
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: CacheList?
-    ) -> MLXArray {
+        _ x: MLXArray, mask: MLXArray?, cache: CacheList?, prevTopkIndices: MLXArray?
+    ) -> (MLXArray, MLXArray?) {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
         let mainCache = cache?[0]
-        let indexerCache = cache?[1]
+        let indexerCache: KVCache? = (cache?.count ?? 0) > 1 ? cache?[1] : nil
 
-        let qr = qALayerNorm!(qAProj!(x))
-        var q = qBProj!(qr)
-        q = q.reshaped(B, L, numHeads, qHeadDim).transposed(0, 2, 1, 3)
+        let qr = qALayerNorm(qAProj(x))
+        let q = qBProj(qr).reshaped(B, L, numHeads, qHeadDim).transposed(0, 2, 1, 3)
         let splitQ = split(q, indices: [qkNopeHeadDim], axis: -1)
-        var (qNope, qPe) = (splitQ[0], splitQ[1])
-        var compressedKv = kvAProjWithMqa(x)
-        let splitCompressedKv = split(compressedKv, indices: [kvLoraRank], axis: -1)
-        compressedKv = splitCompressedKv[0]
-        var kPe = splitCompressedKv[1]
-        kPe = kPe.reshaped(B, L, 1, qkRopeHeadDim).transposed(0, 2, 1, 3)
-        var kv = kvBProj(kvALayerNorm(compressedKv))
-        kv = kv.reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
-        let splitKv = split(kv, indices: [qkNopeHeadDim], axis: -1)
-        var (kNope, values) = (splitKv[0], splitKv[1])
+        var qNope = splitQ[0]
+        var qPe = splitQ[1]
+
+        let compressedKv = kvAProjWithMqa(x)
+        let splitKv = split(compressedKv, indices: [kvLoraRank], axis: -1)
+        var kvLatent = kvALayerNorm(splitKv[0]).expandedDimensions(axis: 1)
+        var kPe = splitKv[1].reshaped(B, L, 1, qkRopeHeadDim).transposed(0, 2, 1, 3)
 
         qPe = applyRotaryPosition(rope, to: qPe, cache: mainCache)
         kPe = applyRotaryPosition(rope, to: kPe, cache: mainCache)
-        kPe = repeated(kPe, count: numHeads, axis: 1)
 
-        // Captured before mainCache.update() below, which mutates mainCache.offset
-        // as its first side effect — reading .offset any later here would already
-        // see the post-update (this-batch-included) value, sizing every mask built
-        // from it one batch too wide against the indexer/attention's actual key
-        // count and crashing the boolean AND/broadcast the first time this runs
-        // with a real (non-nil) cache.
-        let preUpdateOffset = mainCache?.offset ?? 0
-
-        var keys: MLXArray
         if let mainCache {
-            (keys, values) = mainCache.update(
-                keys: concatenated([kNope, kPe], axis: -1), values: values)
+            (kvLatent, kPe) = mainCache.update(keys: kvLatent, values: kPe)
+        }
+
+        let topkIndices: MLXArray?
+        if let indexer {
+            topkIndices = indexer(x, qr: qr, causalMask: mask, cache: indexerCache)
         } else {
-            keys = concatenated([kNope, kPe], axis: -1)
+            topkIndices = prevTopkIndices
         }
-        let queries = concatenated([qNope, qPe], axis: -1)
-
-        // The indexer needs a materialised boolean causal mask to score against
-        // (decode's single new query has nothing causal to exclude, so `nil` is
-        // correct and cheap there); the final attention mask stays whatever
-        // `mask` already is — `.causal`/`.none` — unless the indexer actually
-        // returns a selection, in which case it's replaced with the AND of the
-        // two, forcing materialisation only when sparsity is actually active.
-        var indexerCausalMask: MLXArray? = nil
-        if L > 1 {
-            if case .array(let arr) = mask {
-                indexerCausalMask = arr
-            } else {
-                indexerCausalMask = createCausalMask(n: L, offset: preUpdateOffset)
-            }
-        }
-
-        let topkIndices = indexer(x, qr: qr, causalMask: indexerCausalMask, cache: indexerCache)
 
         var finalMask = mask
         if let topkIndices {
-            let sTotal = keys.dim(2)
-            var sparseMask = MLXArray.zeros([B, 1, L, sTotal], dtype: .bool)
-            sparseMask = putAlong(sparseMask, topkIndices, values: MLXArray(true), axis: -1)
-            // L == 1 (decode): a single new query is causally valid against every
-            // already-cached position, so ANDing in a causal mask here is
-            // provably a no-op — skip rebuilding/reusing one. L > 1 (prefill):
-            // indexerCausalMask is already materialised above and reused as-is.
-            if let indexerCausalMask {
-                sparseMask = sparseMask & indexerCausalMask
+            if L == 1 {
+                let idx = topkIndices[0..., 0..., 0, 0..., .newAxis]
+                kvLatent = takeAlong(
+                    kvLatent, broadcast(idx, to: idx.shape.dropLast() + [kvLatent.dim(-1)]),
+                    axis: 2)
+                kPe = takeAlong(
+                    kPe, broadcast(idx, to: idx.shape.dropLast() + [kPe.dim(-1)]), axis: 2)
+                if let m = finalMask {
+                    finalMask = takeAlong(m, topkIndices, axis: -1)
+                }
+            } else {
+                var shape = topkIndices.shape
+                shape[shape.count - 1] = kvLatent.dim(2)
+                var sparseMask = MLXArray.zeros(shape, dtype: .bool)
+                sparseMask = putAlong(sparseMask, topkIndices, values: MLXArray(true), axis: -1)
+                if let m = finalMask {
+                    sparseMask = sparseMask & m
+                }
+                finalMask = sparseMask
             }
-            finalMask = .array(sparseMask)
         }
 
-        // cache: nil because mainCache.update(...) already ran above (the top-k
-        // mask needs the post-update key count before this call) — passing the
-        // cache again here would double-append. Known cost, shared with
-        // FalconH1's identical CacheList-pair models (which don't route through
-        // attentionWithCacheUpdate at all): this opts DSA attention out of
-        // attentionWithCacheUpdate's TurboKV compressed-history decode/prepend
-        // and its QuantizedKVCacheProtocol routing — both only engage on a
-        // non-nil cache. --turbo-kv and --kv-bits are effectively unsupported for
-        // this model family for now (KV-quantization silently no-ops the same
-        // way for FalconH1's cache pair — see maybeQuantizeKVCache's explicit
-        // "MambaCache and CacheList don't use traditional KV quantization").
-        // Making the CacheList pattern itself TurboKV/quantization-aware is a
-        // separate, cross-cutting change affecting every paired-cache model, not
-        // scoped to this PR.
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: nil,
-            scale: scale,
-            mask: finalMask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        // Keep the indexer cache in the graph even when its selection is unused,
+        // so the graph does not grow across decode steps below index_topk.
+        keepIndexerCacheEvaluated(main: mainCache, indexer: indexerCache)
 
-        return oProj(output)
+        var peScores = matmul(qPe * scale, kPe.swappedAxes(-1, -2))
+        if let finalMask {
+            peScores = which(finalMask, peScores, finiteMinimum(for: peScores.dtype))
+        }
+
+        var output: MLXArray
+        if L == 1 {
+            qNope = embedQ(qNope)
+            output = MLXFast.scaledDotProductAttention(
+                queries: qNope, keys: kvLatent, values: kvLatent, scale: scale, mask: peScores)
+            output = unembedOut(output)
+        } else {
+            let keys = embedQ(kvLatent, transpose: false)
+            let values = unembedOut(kvLatent)
+            output = MLXFast.scaledDotProductAttention(
+                queries: qNope, keys: keys, values: values, scale: scale, mask: peScores)
+        }
+
+        output = output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        return (oProj(output), topkIndices)
+    }
+
+    private func keepIndexerCacheEvaluated(main: KVCache?, indexer: KVCache?) {
+        guard
+            let indexerKeys = (indexer as? KVCacheSimple)?.keys
+                ?? (indexer as? RotatingKVCache)?.keys
+        else { return }
+        if let main = main as? KVCacheSimple, let keys = main.keys {
+            main.keys = depends(input: keys, dependencies: [indexerKeys])
+        } else if let main = main as? RotatingKVCache, let keys = main.keys {
+            main.keys = depends(input: keys, dependencies: [indexerKeys])
+        }
+    }
+
+    /// The most negative finite value of `dtype`, as the reference's `mx.finfo(dtype).min`.
+    private func finiteMinimum(for dtype: DType) -> MLXArray {
+        switch dtype {
+        case .float16: return MLXArray(Float(-65504)).asType(.float16)
+        case .bfloat16: return MLXArray(Float(-3.3895313892515355e38)).asType(.bfloat16)
+        default: return MLXArray(-Float.greatestFiniteMagnitude).asType(dtype)
+        }
     }
 }
 
@@ -490,7 +530,7 @@ class DeepseekV32DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
     init(_ args: DeepseekV32Configuration, layerIdx: Int) {
-        self._selfAttn.wrappedValue = DeepseekV32Attention(args)
+        self._selfAttn.wrappedValue = DeepseekV32Attention(args, layerIdx: layerIdx)
 
         let v3Config = args.v3Configuration
         if v3Config.nRoutedExperts != nil,
@@ -509,12 +549,13 @@ class DeepseekV32DecoderLayer: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: CacheList?
-    ) -> MLXArray {
-        let r = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        _ x: MLXArray, mask: MLXArray?, cache: CacheList?, prevTopkIndices: MLXArray?
+    ) -> (MLXArray, MLXArray?) {
+        let (r, topkIndices) = selfAttn(
+            inputLayerNorm(x), mask: mask, cache: cache, prevTopkIndices: prevTopkIndices)
         let h = x + r
         let r2 = mlp(postAttentionLayerNorm(h))
-        return h + r2
+        return (h + r2, topkIndices)
     }
 }
 
@@ -540,20 +581,21 @@ public class DeepseekV32ModelInner: Module, LayerPartitionable, StreamableMoE {
 
     func callAsFunction(_ x: MLXArray, cache: [CacheList]?) -> MLXArray {
         var h = embedTokens(x)
+        let L = h.dim(1)
 
-        // Unlike DeepseekV3ModelInner, the causal mask is not built once and
-        // shared across layers: each layer's indexer produces its own top-k
-        // selection from its own cache pair, so each layer needs its own
-        // (possibly sparsified) mask. `createAttentionMask` here just gives every
-        // layer the same cheap symbolic `.causal`/`.none` starting point — the
-        // per-layer materialisation only happens inside `DeepseekV32Attention`
-        // when that layer's indexer actually returns a selection.
-        let attentionMask = createAttentionMask(h: h, cache: cache?.first?[0])
+        // One boolean causal mask for every layer; each layer ANDs in its own top-k.
+        let offset = cache?.first?[0].offset ?? 0
+        let mask: MLXArray? = L > 1 ? createCausalMask(n: L, offset: offset) : nil
 
+        var prevTopkIndices: MLXArray? = nil
         for (i, layer) in layers.enumerated() {
-            h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts) {
-                layer(h, mask: attentionMask, cache: cache?[i])
+            let (out, topkIndices) = partitionedLayerCall(
+                index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts
+            ) {
+                layer(h, mask: mask, cache: cache?[i], prevTopkIndices: prevTopkIndices)
             }
+            h = out
+            prevTopkIndices = topkIndices
         }
 
         return norm(h)
@@ -561,7 +603,9 @@ public class DeepseekV32ModelInner: Module, LayerPartitionable, StreamableMoE {
 }
 
 public class DeepseekV32Model: Module, LLMModel, LoRAModel {
-    public var kvHeads: [Int] { Array(repeating: args.numAttentionHeads, count: args.numHiddenLayers) }
+    public var kvHeads: [Int] {
+        Array(repeating: args.numAttentionHeads, count: args.numHiddenLayers)
+    }
 
     var args: DeepseekV32Configuration
     public var model: DeepseekV32ModelInner
@@ -596,30 +640,20 @@ public class DeepseekV32Model: Module, LLMModel, LoRAModel {
         return lmHead(out)
     }
 
-    /// One `CacheList(main, indexer)` pair per layer — mirrors the reference's
-    /// `[CacheList(KVCache(), KVCache()) for _ in self.layers]` and the same
-    /// paired-cache shape `FalconH1Model.newCache` uses for its own two-cache
-    /// hybrid layers. Both children are the same concrete type (`KVCacheSimple`,
-    /// or `RotatingKVCache` when `maxKVSize` is set) so `canTrimPromptCache`/
-    /// `trimPromptCache` (which require every cache to report `isTrimmable`) keep
-    /// working transparently through `CacheList.isTrimmable`/`.trim(_:)`, and so
-    /// the main and indexer caches stay in lockstep — the indexer's own top-k
-    /// scoring assumes its cache offset always equals the main cache's.
-    ///
-    /// This model doesn't conform to `KVCacheDimensionProvider` (its cache shape
-    /// is a CacheList pair, not that protocol's flat `[KVCache]`), so
-    /// `parameters?.maxKVSize` — bounded/rotating cache for constant-memory long
-    /// context, which `KVCacheDimensionProvider`'s default `newCache` provides —
-    /// has to be handled explicitly here instead of coming for free.
+    /// `CacheList(main, indexer)` per layer, or `CacheList(main)` for shared layers,
+    /// which run no indexer. Both children use the same concrete type so trimming
+    /// and the indexer's offset bookkeeping stay in lockstep.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0 ..< args.numHiddenLayers).map { _ in
-            if let maxKVSize = parameters?.maxKVSize {
-                CacheList(
-                    RotatingKVCache(maxSize: maxKVSize, keep: 4),
-                    RotatingKVCache(maxSize: maxKVSize, keep: 4))
-            } else {
-                CacheList(KVCacheSimple(), KVCacheSimple())
+        (0 ..< args.numHiddenLayers).map { layerIdx in
+            let shared =
+                layerIdx < args.indexerTypes.count && args.indexerTypes[layerIdx] == "shared"
+            func make() -> KVCache {
+                if let maxKVSize = parameters?.maxKVSize {
+                    return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                }
+                return KVCacheSimple()
             }
+            return shared ? CacheList(make()) : CacheList(make(), make())
         }
     }
 
@@ -671,6 +705,42 @@ public class DeepseekV32Model: Module, LLMModel, LoRAModel {
                         newWeights["\(prefix).mlp.switch_mlp.\(projName).\(key)"] = stacked(joined)
                     }
                 }
+            }
+        }
+
+        // Checkpoints with `kv_b_proj` (GLM-5.2, DeepSeek V3.2) are split into the
+        // absorbed per-head `embed_q` / `unembed_out` that GLM-5.3 ships directly.
+        for l in 0 ..< args.numHiddenLayers {
+            let prefix = "model.layers.\(l).self_attn"
+            guard let packed = newWeights.removeValue(forKey: "\(prefix).kv_b_proj.weight") else {
+                continue
+            }
+            let scales = newWeights.removeValue(forKey: "\(prefix).kv_b_proj.scales")
+            let biases = newWeights.removeValue(forKey: "\(prefix).kv_b_proj.biases")
+            var bits = 0
+            var groupSize = 0
+            var full = packed
+            if let scales {
+                bits = packed.dim(-1) * 32 / args.kvLoraRank
+                groupSize = args.kvLoraRank / scales.dim(-1)
+                full = dequantized(
+                    packed, scales: scales, biases: biases, groupSize: groupSize, bits: bits)
+            }
+            full = full.reshaped(args.numAttentionHeads, args.qkNopeHeadDim + args.vHeadDim, -1)
+            let wk = full[0..., ..<args.qkNopeHeadDim, 0...].swappedAxes(-1, -2)
+            let wv = full[0..., args.qkNopeHeadDim..., 0...]
+            if scales != nil {
+                let (qk, sk, bk) = quantized(wk, groupSize: groupSize, bits: bits)
+                let (qv, sv, bv) = quantized(wv, groupSize: groupSize, bits: bits)
+                newWeights["\(prefix).embed_q.weight"] = qk
+                newWeights["\(prefix).embed_q.scales"] = sk
+                newWeights["\(prefix).embed_q.biases"] = bk
+                newWeights["\(prefix).unembed_out.weight"] = qv
+                newWeights["\(prefix).unembed_out.scales"] = sv
+                newWeights["\(prefix).unembed_out.biases"] = bv
+            } else {
+                newWeights["\(prefix).embed_q.weight"] = wk
+                newWeights["\(prefix).unembed_out.weight"] = wv
             }
         }
 
