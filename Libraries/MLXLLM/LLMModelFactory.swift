@@ -89,6 +89,9 @@ public enum LLMTypeRegistry {
         "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
         "deepseek_v2": create(DeepseekV2Configuration.self, DeepseekV2Model.init),
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+        // Kimi K2 (`kimi_k2`) is DeepSeek-V3 with a different expert count; mlx-lm
+        // aliases it to the V3 model class, so do the same here.
+        "kimi_k2": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
         // DeepSeek Sparse Attention. GLM-5.2 (`glm_moe_dsa`) is the same architecture —
         // in mlx-lm its model class is a bare subclass of the V3.2 one — so it maps to
         // the same Swift model rather than getting a parallel implementation.
