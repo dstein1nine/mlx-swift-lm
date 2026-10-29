@@ -586,7 +586,7 @@ public func loadWeights(
                     stripped0Name = stripped0Name.replacingOccurrences(of: "model.", with: "")
                     let strippedMtpName = stripped0Name.replacingOccurrences(of: ".mtp.0.", with: ".mtp.")
                     
-                    let allPrefixes = ["", "model.", "language_model.", "model.language_model."]
+                    let allPrefixes = ["", "model.", "language_model.", "model.language_model.", "language_model.model."]
                     let candidates = [expert0Name, stripped0Name, strippedMtpName] + allPrefixes.map { $0 + stripped0Name } + allPrefixes.map { $0 + strippedMtpName }
                     var foundUnstacked = false
                     var matchedCandidate = ""
@@ -629,13 +629,20 @@ public func loadWeights(
                 strippedBareName = strippedBareName.replacingOccurrences(of: "model.", with: "")
                 let strippedMtpBareName = strippedBareName.replacingOccurrences(of: ".mtp.0.", with: ".mtp.")
                 
-                let allPrefixes = ["", "model.", "language_model.", "model.language_model."]
+                let allPrefixes = ["", "model.", "language_model.", "model.language_model.", "language_model.model."]
                 let normalCandidates = [bareName, strippedBareName, strippedMtpBareName] + allPrefixes.map { $0 + strippedBareName } + allPrefixes.map { $0 + strippedMtpBareName }
                 
-                let originalKey = normalCandidates
-                    .first { ExpertStreamerManager.shared?.getFile(for: $0) != nil }
-                    ?? bareName  // fallback: use bare name
-                sl.tensorName = originalKey
+                if let originalKey = normalCandidates
+                    .first(where: { ExpertStreamerManager.shared?.getFile(for: $0) != nil }) {
+                    sl.tensorName = originalKey
+                } else {
+                    // No shard entry matched. Direct-NVMe streaming cannot resolve this
+                    // layer, so the expert path degrades to the mmap fallback, which
+                    // page-faults file-backed memory on the GPU and times out on large
+                    // models. Say so loudly instead of failing later inside a kernel.
+                    print("[Load] WARNING: no shard index entry for streamed expert tensor \(bareName); tried \(normalCandidates.count) prefixes. Expert reads will use the mmap fallback.")
+                    sl.tensorName = bareName
+                }
             }
         }
     }
