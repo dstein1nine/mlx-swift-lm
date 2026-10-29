@@ -89,9 +89,14 @@ public enum LLMTypeRegistry {
         "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
         "deepseek_v2": create(DeepseekV2Configuration.self, DeepseekV2Model.init),
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
-        // Kimi K2 (`kimi_k2`) is DeepSeek-V3 with a different expert count; mlx-lm
-        // aliases it to the V3 model class, so do the same here.
-        "kimi_k2": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+        // Kimi K2 (`kimi_k2`) and the VLM-wrapped K2.5/K2.6 (`kimi_k25`) are DeepSeek-V3
+        // with a different expert count. They go to the V3.2 model rather than V3 because
+        // recent mlx-community conversions ship attention in the absorbed `embed_q` /
+        // `unembed_out` layout that only the V3.2 port understands (it still converts
+        // older `kv_b_proj` checkpoints itself); with no indexer configured, V3.2
+        // attention is plain V3 attention. The config decoder unwraps `text_config`.
+        "kimi_k2": create(DeepseekV32Configuration.self, DeepseekV32Model.init),
+        "kimi_k25": create(DeepseekV32Configuration.self, DeepseekV32Model.init),
         // DeepSeek Sparse Attention. GLM-5.2 (`glm_moe_dsa`) is the same architecture —
         // in mlx-lm its model class is a bare subclass of the V3.2 one — so it maps to
         // the same Swift model rather than getting a parallel implementation.

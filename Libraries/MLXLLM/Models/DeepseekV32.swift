@@ -124,8 +124,24 @@ public struct DeepseekV32Configuration: Codable, Sendable {
         case indexTopkPattern = "index_topk_pattern"
     }
 
+    /// Kimi K2.5/K2.6 (`kimi_k25`) ship the text model nested under `text_config`
+    /// inside a VLM shell whose top level carries no model fields.
+    private enum WrapperKeys: String, CodingKey {
+        case textConfig = "text_config"
+    }
+
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let root = try decoder.container(keyedBy: CodingKeys.self)
+        let wrapper = try decoder.container(keyedBy: WrapperKeys.self)
+        let nested = !root.contains(.hiddenSize) && wrapper.contains(.textConfig)
+        let c =
+            nested
+            ? try wrapper.nestedContainer(keyedBy: CodingKeys.self, forKey: .textConfig)
+            : root
+        let patterns =
+            nested
+            ? try wrapper.nestedContainer(keyedBy: PatternKeys.self, forKey: .textConfig)
+            : try decoder.container(keyedBy: PatternKeys.self)
 
         vocabSize = try c.decode(Int.self, forKey: .vocabSize)
         hiddenSize = try c.decode(Int.self, forKey: .hiddenSize)
@@ -167,7 +183,6 @@ public struct DeepseekV32Configuration: Codable, Sendable {
         // configs have none of these and resolve to all "full".
         indexTopkFreq = max(try c.decodeIfPresent(Int.self, forKey: .indexTopkFreq) ?? 1, 1)
         indexSkipTopkOffset = try c.decodeIfPresent(Int.self, forKey: .indexSkipTopkOffset) ?? 2
-        let patterns = try decoder.container(keyedBy: PatternKeys.self)
         if let explicit = try c.decodeIfPresent([String].self, forKey: .indexerTypes) {
             indexerTypes = explicit
         } else if let pattern = try? patterns.decodeIfPresent(
@@ -184,6 +199,12 @@ public struct DeepseekV32Configuration: Codable, Sendable {
             indexerTypes = (0 ..< numHiddenLayers).map {
                 max($0 - offset + 1, 0) % freq == 0 ? "full" : "shared"
             }
+        }
+        // No indexer at all (DeepSeek V3 / Kimi K2.x configs routed here for their
+        // absorbed-MLA layout): a "shared" layer with no selection to share runs
+        // dense attention, so marking every layer shared is plain V3 attention.
+        if indexNHeads == 0 || indexHeadDim == 0 {
+            indexerTypes = Array(repeating: "shared", count: numHiddenLayers)
         }
 
         // GLM-5.2 carries no top-level `rope_theta`/`rope_scaling`; both live inside a
@@ -667,6 +688,16 @@ public class DeepseekV32Model: Module, LLMModel, LoRAModel {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // VLM-wrapped checkpoints (Kimi K2.5/K2.6) prefix every text weight with
+        // `language_model.`; the vision tower is not shipped in the MLX repos.
+        let llmPrefix = "language_model."
+        let weights =
+            weights.keys.contains { $0.hasPrefix(llmPrefix) }
+            ? Dictionary(
+                uniqueKeysWithValues: weights.map { k, v in
+                    (k.hasPrefix(llmPrefix) ? String(k.dropFirst(llmPrefix.count)) : k, v)
+                })
+            : weights
         var newWeights = weights
 
         func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {

@@ -39,6 +39,26 @@ public struct BaseConfiguration: Codable, Sendable {
         /// Internal storage for the quantization mode.
         private var _mode: QuantizationMode? = nil
 
+        /// mlx-lm writes `"group_size": null` (and can write `"bits": null`) for a
+        /// per-layer entry it left at MLX's own default — Kimi K2.6's mixed quant does
+        /// this for every one of its 731 layer entries. Resolve a missing value the
+        /// way `quantization_params_from_mode` in mlx/ops.cpp does, per mode.
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let mode = try c.decodeIfPresent(QuantizationMode.self, forKey: ._mode)
+            let (defaultGroupSize, defaultBits): (Int, Int) =
+                switch mode ?? .affine {
+                case .affine: (64, 4)
+                case .nvfp4: (16, 4)
+                case .mxfp4: (32, 4)
+                case .mxfp8: (32, 8)
+                }
+            self.groupSize =
+                try c.decodeIfPresent(Int.self, forKey: .groupSize) ?? defaultGroupSize
+            self.bits = try c.decodeIfPresent(Int.self, forKey: .bits) ?? defaultBits
+            self._mode = mode
+        }
+
         /// The quantization method to use (defaults to `.affine`).
         ///
         /// Affine quantization (asymmetric) uses both a scale and a zero-point
