@@ -320,8 +320,13 @@ class DeepseekV3MoE: Module, UnaryLayer {
         }
     }
 
+    /// Routed expert indices from the most recent call; only kept while
+    /// `RoutingProbe` is enabled.
+    var lastRoutedIndices: MLXArray?
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
+        if RoutingProbe.shared != nil { lastRoutedIndices = indices }
         var y = switchMLP(x, indices)
         y = weightedExpertSum(y, scores)
 
