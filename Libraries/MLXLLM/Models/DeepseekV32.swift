@@ -578,7 +578,9 @@ class DeepseekV32DecoderLayer: Module {
         let (r, topkIndices) = selfAttn(
             inputLayerNorm(x), mask: mask, cache: cache, prevTopkIndices: prevTopkIndices)
         let h = x + r
-        if !lookaheadLinks.isEmpty, h.dim(1) == 1, let moe = mlp as? DeepseekV3MoE {
+        if !lookaheadLinks.isEmpty, h.dim(1) == 1, SwitchGLU.lookaheadActive,
+            let moe = mlp as? DeepseekV3MoE
+        {
             moe.switchMLP.lookahead = lookaheadLinks.map {
                 ExpertLookahead(predicted: $0.predict(h), target: $0.next.switchMLP)
             }

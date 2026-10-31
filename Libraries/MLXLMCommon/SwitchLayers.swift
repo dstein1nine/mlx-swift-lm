@@ -155,13 +155,20 @@ open class SwitchGLU: Module, @unchecked Sendable {
     }()
 
     /// Experts to prefetch for the next MoE layer during decode, guessed by running that
-    /// layer's router early. 0 (default) disables. `MLX_MOE_PREFETCH_TOPK=N`.
+    /// layer's router early. Default 6 (K2.6: 2.87 -> 3.05 tok/s); 0 disables.
+    /// `MLX_MOE_PREFETCH_TOPK=N`.
     public static let lookaheadTopK: Int =
-        Int(ProcessInfo.processInfo.environment["MLX_MOE_PREFETCH_TOPK"] ?? "") ?? 0
+        Int(ProcessInfo.processInfo.environment["MLX_MOE_PREFETCH_TOPK"] ?? "") ?? 6
 
-    /// First layer index to prefetch for; early layers predict poorly. `MLX_MOE_PREFETCH_MIN_LAYER=N`.
+    /// First layer index to prefetch for; early layers predict poorly. Default 7.
+    /// `MLX_MOE_PREFETCH_MIN_LAYER=N`.
     public static let lookaheadMinLayer: Int =
-        Int(ProcessInfo.processInfo.environment["MLX_MOE_PREFETCH_MIN_LAYER"] ?? "") ?? 0
+        Int(ProcessInfo.processInfo.environment["MLX_MOE_PREFETCH_MIN_LAYER"] ?? "") ?? 7
+
+    /// True when MoE layers take the stacked streaming path, the only consumer of `lookahead`.
+    public static var lookaheadActive: Bool {
+        lookaheadTopK > 0 && useStackedBuffers && ExpertStreamingConfig.shared.isEnabled
+    }
 
     /// How many MoE layers ahead to guess. Each layer guesses for the next `depth` layers;
     /// nearer, fresher guesses only add experts not already resident or claimed.
