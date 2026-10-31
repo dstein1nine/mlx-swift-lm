@@ -80,4 +80,35 @@ final class ExpertSlotTableTests: XCTestCase {
         XCTAssertEqual(e.length, 256)
         XCTAssertNil(tensor.slab(4, path: "f"))
     }
+
+    func testMissNeverEvictsAPrefetchedExpertRoutedLaterInTheList() {
+        let table = makeTable(3)
+        table.beginToken()
+        _ = table.resolve([1, 2, 3])
+        // Prefetch 9 into the oldest slot; it keeps that slot's old lastUsed.
+        XCTAssertEqual(table.claim([9]).map(\.slot), [0])
+        table.beginToken()
+        // 7 misses before 9 is reached; it must not take 9's slot.
+        let r = table.resolve([7, 9])
+        XCTAssertEqual(r?.misses.map(\.expert), [7])
+        XCTAssertEqual(r?.slots[1], 0, "9 stays a hit in its prefetched slot")
+    }
+
+    func testClaimSkipsResidentExperts() {
+        let table = makeTable(4)
+        table.beginToken()
+        _ = table.resolve([1, 2])
+        let claimed = table.claim([2, 5])
+        XCTAssertEqual(claimed.map(\.expert), [5])
+        XCTAssertEqual(table.occupant.compactMap { $0 }.sorted(), [1, 2, 5])
+    }
+
+    func testReleasedSlotsBecomeMisses() {
+        let table = makeTable(2)
+        table.beginToken()
+        let claimed = table.claim([4])
+        table.release(claimed.map(\.slot))
+        table.beginToken()
+        XCTAssertEqual(table.resolve([4])?.misses.map(\.expert), [4])
+    }
 }

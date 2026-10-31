@@ -75,10 +75,15 @@ public final class ExpertSlotTable {
     /// Claim slots for predicted experts that are not resident. Claimed slots
     /// keep their `lastUsed`, so an unused prediction is the first to go.
     public func claimPredicted() -> [(slot: Int, expert: Int)] {
+        claim(predictor.predict())
+    }
+
+    /// Claim slots for `experts` that are not resident, for a read ahead of routing.
+    public func claim(_ experts: [Int]) -> [(slot: Int, expert: Int)] {
         var resident = residentSlots()
         var claimed = Set<Int>()
         var targets: [(slot: Int, expert: Int)] = []
-        for expert in predictor.predict() where resident[expert] == nil {
+        for expert in experts where resident[expert] == nil {
             guard let slot = policy.victim(in: self, excluding: claimed) else { break }
             if let old = occupant[slot] { resident.removeValue(forKey: old) }
             occupant[slot] = expert
@@ -89,36 +94,47 @@ public final class ExpertSlotTable {
         return targets
     }
 
+    /// Empty `slots`, e.g. after a failed read left their contents undefined.
+    public func release(_ slots: [Int]) {
+        for s in slots { occupant[s] = nil }
+    }
+
     /// Map each routed expert to a slot. Returns nil, with the table unchanged,
     /// when the slots run out; otherwise the slot per expert and the misses that
     /// must be read.
-    public func resolve(_ experts: [Int]) -> (slots: [Int], misses: [(slot: Int, expert: Int)])? {
+    /// `reserved` slots are never chosen as victims (e.g. a read is still landing in them).
+    public func resolve(
+        _ experts: [Int], reserved: Set<Int> = []
+    ) -> (slots: [Int], misses: [(slot: Int, expert: Int)])? {
         let savedOccupant = occupant
         let savedLastUsed = lastUsed
         var resident = residentSlots()
-        var claimed = Set<Int>()
-        var slots: [Int] = []
+        var slots = [Int](repeating: -1, count: experts.count)
         var misses: [(slot: Int, expert: Int)] = []
-        for expert in experts {
+        // Hits first, so a miss can never evict an expert routed later in the list
+        // (prefetched slots keep an old lastUsed and would otherwise go first).
+        var claimed = reserved
+        for (n, expert) in experts.enumerated() {
             if let slot = resident[expert], !claimed.contains(slot) {
-                slots.append(slot)
+                slots[n] = slot
                 claimed.insert(slot)
                 lastUsed[slot] = tick
-            } else {
-                guard let slot = policy.victim(in: self, excluding: claimed) else {
-                    // A partial update would leave slots naming experts that were never read.
-                    occupant = savedOccupant
-                    lastUsed = savedLastUsed
-                    return nil
-                }
-                if let old = occupant[slot] { resident.removeValue(forKey: old) }
-                occupant[slot] = expert
-                resident[expert] = slot
-                lastUsed[slot] = tick
-                claimed.insert(slot)
-                slots.append(slot)
-                misses.append((slot, expert))
             }
+        }
+        for (n, expert) in experts.enumerated() where slots[n] < 0 {
+            guard let slot = policy.victim(in: self, excluding: claimed) else {
+                // A partial update would leave slots naming experts that were never read.
+                occupant = savedOccupant
+                lastUsed = savedLastUsed
+                return nil
+            }
+            if let old = occupant[slot] { resident.removeValue(forKey: old) }
+            occupant[slot] = expert
+            resident[expert] = slot
+            lastUsed[slot] = tick
+            claimed.insert(slot)
+            slots[n] = slot
+            misses.append((slot, expert))
         }
         predictor.observe(experts)
         return (slots, misses)
