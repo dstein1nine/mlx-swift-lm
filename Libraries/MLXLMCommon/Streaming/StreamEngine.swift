@@ -35,6 +35,10 @@ public final class StreamEngine: @unchecked Sendable {
     public var queueDepth: Int
     /// Bypass the unified buffer cache (`F_NOCACHE`).
     public var noCache: Bool
+    /// Split extents into preads of at most this many bytes, so a layer's few
+    /// misses still keep more reads in flight (`MLX_MOE_STREAM_CHUNK_KB`, default 2048:
+    /// +2.6% decode on K2.6; 256 KB is slower). 0 means one pread per extent.
+    public var chunkBytes: Int
 
     private let lock = NSLock()
     private var metrics = Metrics()
@@ -44,6 +48,26 @@ public final class StreamEngine: @unchecked Sendable {
         queueDepth = Int(environment["MLX_MOE_STREAM_QD"] ?? "") ?? 0
         let nc = environment["MLX_MOE_STREAM_NOCACHE"] ?? ""
         noCache = nc == "1" || nc.lowercased() == "true"
+        chunkBytes = (Int(environment["MLX_MOE_STREAM_CHUNK_KB"] ?? "") ?? 2048) * 1024
+    }
+
+    /// `jobs` with every extent longer than `chunkBytes` split into consecutive pieces.
+    func split(_ jobs: [ReadJob]) -> [ReadJob] {
+        guard chunkBytes > 0, jobs.contains(where: { $0.extent.length > chunkBytes }) else { return jobs }
+        var out: [ReadJob] = []
+        for job in jobs {
+            var done = 0
+            while done < job.extent.length {
+                let n = min(chunkBytes, job.extent.length - done)
+                out.append(ReadJob(
+                    dst: job.dst, dstOffset: job.dstOffset + done,
+                    extent: UnitExtent(
+                        path: job.extent.path, fileOffset: job.extent.fileOffset + UInt64(done),
+                        length: n)))
+                done += n
+            }
+        }
+        return out
     }
 
     /// Next layer index; each streaming MoE layer registers once.
@@ -68,6 +92,7 @@ public final class StreamEngine: @unchecked Sendable {
     @discardableResult
     public func read(_ jobs: [ReadJob], units: Int, kind: ReadKind) -> SSDStreamingError? {
         guard !jobs.isEmpty else { return nil }
+        let jobs = split(jobs)
         let errState = ThreadSafeError()
         let noCache = self.noCache
         let workers = queueDepth > 0 ? min(queueDepth, jobs.count) : jobs.count
