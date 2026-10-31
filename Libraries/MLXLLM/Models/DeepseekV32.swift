@@ -549,6 +549,8 @@ class DeepseekV32DecoderLayer: Module {
     var mlp: UnaryLayer
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+    /// Next MoE layer, for expert prefetch during decode (`MLX_MOE_PREFETCH_TOPK`).
+    var lookaheadLink: ExpertLookaheadLink?
 
     init(_ args: DeepseekV32Configuration, layerIdx: Int) {
         self._selfAttn.wrappedValue = DeepseekV32Attention(args, layerIdx: layerIdx)
@@ -575,8 +577,31 @@ class DeepseekV32DecoderLayer: Module {
         let (r, topkIndices) = selfAttn(
             inputLayerNorm(x), mask: mask, cache: cache, prevTopkIndices: prevTopkIndices)
         let h = x + r
+        if let link = lookaheadLink, h.dim(1) == 1, let moe = mlp as? DeepseekV3MoE {
+            moe.switchMLP.lookahead = ExpertLookahead(
+                predicted: link.predict(h), target: link.next.switchMLP)
+        }
         let r2 = mlp(postAttentionLayerNorm(h))
         return (h + r2, topkIndices)
+    }
+}
+
+/// Guesses the next MoE layer's experts by running its router on this layer's
+/// post-attention hidden state. Ranks by `sigmoid(x Wᵀ) + bias`, exact for `n_group == 1`.
+final class ExpertLookaheadLink {
+    let norm: RMSNorm
+    let next: DeepseekV3MoE
+    let topK: Int
+
+    init(norm: RMSNorm, next: DeepseekV3MoE, topK: Int) {
+        self.norm = norm
+        self.next = next
+        self.topK = topK
+    }
+
+    func predict(_ h: MLXArray) -> MLXArray {
+        let scores = sigmoid(norm(h).matmul(next.gate.weight.T)) + next.gate.e_score_correction_bias
+        return argPartition(-scores, kth: topK - 1, axis: -1)[.ellipsis, ..<topK].flattened()
     }
 }
 
@@ -598,6 +623,18 @@ public class DeepseekV32ModelInner: Module, LayerPartitionable, StreamableMoE {
             DeepseekV32DecoderLayer(args, layerIdx: $0)
         }
         self._norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+
+        let k = SwitchGLU.lookaheadTopK
+        let groups = args.v3Configuration.nGroup ?? 1
+        if k > 0, groups == 1 {
+            for i in 0 ..< layers.count - 1 where i + 1 >= SwitchGLU.lookaheadMinLayer {
+                guard layers[i].mlp is DeepseekV3MoE,
+                    let next = layers[i + 1].mlp as? DeepseekV3MoE
+                else { continue }
+                layers[i].lookaheadLink = ExpertLookaheadLink(
+                    norm: layers[i + 1].postAttentionLayerNorm, next: next, topK: k)
+            }
+        }
     }
 
     func callAsFunction(_ x: MLXArray, cache: [CacheList]?) -> MLXArray {
@@ -608,8 +645,12 @@ public class DeepseekV32ModelInner: Module, LayerPartitionable, StreamableMoE {
         let offset = cache?.first?[0].offset ?? 0
         let mask: MLXArray? = L > 1 ? createCausalMask(n: L, offset: offset) : nil
 
+        let probe = L == 1 ? RoutingProbe.shared : nil
+        var probeInputs: [MLXArray] = []
+
         var prevTopkIndices: MLXArray? = nil
         for (i, layer) in layers.enumerated() {
+            if probe != nil { probeInputs.append(h) }
             let (out, topkIndices) = partitionedLayerCall(
                 index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts
             ) {
@@ -617,6 +658,16 @@ public class DeepseekV32ModelInner: Module, LayerPartitionable, StreamableMoE {
             }
             h = out
             prevTopkIndices = topkIndices
+        }
+
+        if let probe {
+            var actual: [Int: MLXArray] = [:]
+            for (i, layer) in layers.enumerated() {
+                if let moe = layer.mlp as? DeepseekV3MoE, let idx = moe.lastRoutedIndices {
+                    actual[i] = idx
+                }
+            }
+            probe.record(layers: layers, inputs: probeInputs, actual: actual)
         }
 
         return norm(h)
