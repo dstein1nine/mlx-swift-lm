@@ -549,8 +549,9 @@ class DeepseekV32DecoderLayer: Module {
     var mlp: UnaryLayer
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
-    /// Next MoE layer, for expert prefetch during decode (`MLX_MOE_PREFETCH_TOPK`).
-    var lookaheadLink: ExpertLookaheadLink?
+    /// Later MoE layers, nearest first, for expert prefetch during decode
+    /// (`MLX_MOE_PREFETCH_TOPK`, `MLX_MOE_PREFETCH_DEPTH`).
+    var lookaheadLinks: [ExpertLookaheadLink] = []
 
     init(_ args: DeepseekV32Configuration, layerIdx: Int) {
         self._selfAttn.wrappedValue = DeepseekV32Attention(args, layerIdx: layerIdx)
@@ -577,16 +578,17 @@ class DeepseekV32DecoderLayer: Module {
         let (r, topkIndices) = selfAttn(
             inputLayerNorm(x), mask: mask, cache: cache, prevTopkIndices: prevTopkIndices)
         let h = x + r
-        if let link = lookaheadLink, h.dim(1) == 1, let moe = mlp as? DeepseekV3MoE {
-            moe.switchMLP.lookahead = ExpertLookahead(
-                predicted: link.predict(h), target: link.next.switchMLP)
+        if !lookaheadLinks.isEmpty, h.dim(1) == 1, let moe = mlp as? DeepseekV3MoE {
+            moe.switchMLP.lookahead = lookaheadLinks.map {
+                ExpertLookahead(predicted: $0.predict(h), target: $0.next.switchMLP)
+            }
         }
         let r2 = mlp(postAttentionLayerNorm(h))
         return (h + r2, topkIndices)
     }
 }
 
-/// Guesses the next MoE layer's experts by running its router on this layer's
+/// Guesses a later MoE layer's experts by running its router on this layer's
 /// post-attention hidden state. Ranks by `sigmoid(x Wᵀ) + bias`, exact for `n_group == 1`.
 final class ExpertLookaheadLink {
     let norm: RMSNorm
@@ -627,12 +629,13 @@ public class DeepseekV32ModelInner: Module, LayerPartitionable, StreamableMoE {
         let k = SwitchGLU.lookaheadTopK
         let groups = args.v3Configuration.nGroup ?? 1
         if k > 0, groups == 1 {
-            for i in 0 ..< layers.count - 1 where i + 1 >= SwitchGLU.lookaheadMinLayer {
-                guard layers[i].mlp is DeepseekV3MoE,
-                    let next = layers[i + 1].mlp as? DeepseekV3MoE
-                else { continue }
-                layers[i].lookaheadLink = ExpertLookaheadLink(
-                    norm: layers[i + 1].postAttentionLayerNorm, next: next, topK: k)
+            for i in layers.indices where layers[i].mlp is DeepseekV3MoE {
+                for j in i + 1 ..< min(i + 1 + SwitchGLU.lookaheadDepth, layers.count)
+                where j >= SwitchGLU.lookaheadMinLayer {
+                    guard let next = layers[j].mlp as? DeepseekV3MoE else { continue }
+                    layers[i].lookaheadLinks.append(ExpertLookaheadLink(
+                        norm: layers[j].postAttentionLayerNorm, next: next, topK: k))
+                }
             }
         }
     }

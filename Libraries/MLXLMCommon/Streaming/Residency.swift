@@ -79,11 +79,15 @@ public final class ExpertSlotTable {
     }
 
     /// Claim slots for `experts` that are not resident, for a read ahead of routing.
-    public func claim(_ experts: [Int]) -> [(slot: Int, expert: Int)] {
+    /// `reserved` slots are never chosen as victims; at most `limit` slots are claimed.
+    public func claim(
+        _ experts: [Int], reserved: Set<Int> = [], limit: Int = .max
+    ) -> [(slot: Int, expert: Int)] {
         var resident = residentSlots()
-        var claimed = Set<Int>()
+        var claimed = reserved
         var targets: [(slot: Int, expert: Int)] = []
         for expert in experts where resident[expert] == nil {
+            guard targets.count < limit else { break }
             guard let slot = policy.victim(in: self, excluding: claimed) else { break }
             if let old = occupant[slot] { resident.removeValue(forKey: old) }
             occupant[slot] = expert

@@ -163,14 +163,21 @@ open class SwitchGLU: Module, @unchecked Sendable {
     public static let lookaheadMinLayer: Int =
         Int(ProcessInfo.processInfo.environment["MLX_MOE_PREFETCH_MIN_LAYER"] ?? "") ?? 0
 
+    /// How many MoE layers ahead to guess. Each layer guesses for the next `depth` layers;
+    /// nearer, fresher guesses only add experts not already resident or claimed.
+    /// `MLX_MOE_PREFETCH_DEPTH=N`, default 1.
+    public static let lookaheadDepth: Int =
+        max(1, Int(ProcessInfo.processInfo.environment["MLX_MOE_PREFETCH_DEPTH"] ?? "") ?? 1)
+
     static let prefetchQueue = DispatchQueue(label: "mlx.moe.prefetch", qos: .userInitiated)
 
-    /// Guess for the next layer's experts, set by the model before this layer runs.
-    public var lookahead: ExpertLookahead?
+    /// Guesses for later layers' experts, set by the model before this layer runs.
+    public var lookahead: [ExpertLookahead] = []
 
-    private var _pendingPrefetch: PendingPrefetch?
+    /// Background reads claimed for this layer during the current token, oldest first.
+    private var _pendingPrefetches: [PendingPrefetch] = []
     /// Reads for wrong guesses that were still running when routing resolved.
-    private var _stalePrefetch: PendingPrefetch?
+    private var _stalePrefetches: [PendingPrefetch] = []
 
     // ── Stacked-buffer fused-matmul fast path (default when streaming; MLX_MOE_STACKED=0 disables) ──
     // When enabled, allocate a single stacked weight buffer of shape
@@ -339,13 +346,11 @@ open class SwitchGLU: Module, @unchecked Sendable {
             // Warm path: kick off GPU work asynchronously while we
             // speculatively prefetch the prev-token's experts. The pread
             // overlaps with the GPU-side resolution of `idx`.
-            if let guess = lookahead?.predicted { asyncEval(idx, guess) } else { asyncEval(idx) }
+            asyncEval([idx] + lookahead.map(\.predicted))
         }
         let table = _slotTable!
-        if let stale = _stalePrefetch {
-            table.release(stale.waitAll())
-            _stalePrefetch = nil
-        }
+        for stale in _stalePrefetches { table.release(stale.waitAll()) }
+        _stalePrefetches = []
         table.beginToken()
 
         // Previous-token prediction; it never fires under LRU (those experts are still resident).
@@ -357,7 +362,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
             }
         }
         let ahead = lookahead
-        lookahead = nil
+        lookahead = []
 
         if idx.size == 0 {
             var outShape = x.shape
@@ -373,7 +378,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
         // By now, GPU work (current attention + router) is mostly done, AND
         // most of this token's experts are already in cache via spec prefetch.
         let cpuIndices = idx.asArray(UInt32.self)
-        let aheadExperts = ahead.map { $0.predicted.asArray(Int32.self).map(Int.init) }
+        let aheadExperts = ahead.map { ($0.target, $0.predicted.asArray(Int32.self).map(Int.init)) }
         var ranges = [ExpertRange]()
         var startIdx = 0
         while startIdx < cpuIndices.count {
@@ -385,13 +390,14 @@ open class SwitchGLU: Module, @unchecked Sendable {
         }
 
         var reserved = Set<Int>()
-        if let pending = _pendingPrefetch {
-            let settled = pending.settle(needed: Set(ranges.map { $0.id }))
+        let needed = Set(ranges.map { $0.id })
+        for pending in _pendingPrefetches {
+            let settled = pending.settle(needed: needed)
             table.release(settled.release)
-            reserved = settled.inFlight
-            _pendingPrefetch = nil
-            if !settled.inFlight.isEmpty { _stalePrefetch = pending }
+            reserved.formUnion(settled.inFlight)
+            if !settled.inFlight.isEmpty { _stalePrefetches.append(pending) }
         }
+        _pendingPrefetches = []
         guard let resolution = table.resolve(ranges.map { $0.id }, reserved: reserved) else { return nil }
         let slotForRange = resolution.slots
         StreamEngine.shared.recordResolution(
@@ -408,9 +414,10 @@ open class SwitchGLU: Module, @unchecked Sendable {
                 placementJobs(resolution.misses, isFused: isFused),
                 units: resolution.misses.count, kind: .miss)
         }
-        // Next layer's reads overlap this layer's expert compute and its own attention.
-        if let target = ahead?.target, let aheadExperts {
-            target.prefetchAhead(aheadExperts)
+        // Later layers' reads overlap the compute in between. Nearest first: the
+        // prefetch queue is FIFO.
+        for (target, experts) in aheadExperts {
+            target.prefetchAhead(experts)
         }
 
         // ── Build slotPerToken + slotExperts arrays for fused compute ──
@@ -450,10 +457,19 @@ open class SwitchGLU: Module, @unchecked Sendable {
 
     /// Claim slots for guessed experts and read them on a background queue.
     /// Safe to overwrite: the caller's routing readback already waited for every
-    /// earlier GPU use of this layer's slots.
+    /// earlier GPU use of this layer's slots (they were last used by the previous token).
+    /// Never evicts a slot another guess for this layer claimed, and claims at most half
+    /// the slots in total so routing (top-8 of 16) always finds room.
     func prefetchAhead(_ experts: [Int]) {
-        guard let table = _slotTable, _pendingPrefetch == nil, _stalePrefetch == nil else { return }
-        let targets = table.claim(experts)
+        guard let table = _slotTable else { return }
+        // Wrong guesses from the previous token that are still landing: skip, don't block.
+        guard _stalePrefetches.allSatisfy({ $0.isFinished }) else { return }
+        for stale in _stalePrefetches { table.release(stale.waitAll()) }
+        _stalePrefetches = []
+        let held = _pendingPrefetches.reduce(into: Set<Int>()) { $0.formUnion($1.slots) }
+        let budget = table.capacity / 2 - held.count
+        guard budget > 0 else { return }
+        let targets = table.claim(experts, reserved: held, limit: budget)
         guard !targets.isEmpty else { return }
         let isFused = SwitchGLU.useFusedGateUp
         let jobsPerExpert = targets.map { placementJobs([$0], isFused: isFused) }
@@ -465,7 +481,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
                 pending.finish(i, ok: err == nil)
             }
         }
-        _pendingPrefetch = pending
+        _pendingPrefetches.append(pending)
     }
 
     /// One expert's gate, up and down weight extents.
@@ -2019,6 +2035,15 @@ final class PendingPrefetch: @unchecked Sendable {
         self.state = Array(repeating: .queued, count: targets.count)
     }
 
+    var slots: [Int] { targets.map(\.slot) }
+
+    /// True when no read is queued or running.
+    var isFinished: Bool {
+        cond.lock()
+        defer { cond.unlock() }
+        return !state.contains { $0 == .queued || $0 == .running }
+    }
+
     /// Called by the reader; false when the guess was cancelled before it started.
     func begin(_ i: Int) -> Bool {
         cond.lock()
@@ -2035,18 +2060,18 @@ final class PendingPrefetch: @unchecked Sendable {
         cond.unlock()
     }
 
-    /// Cancel unneeded guesses that have not started and wait for needed ones.
+    /// Cancel every guess that has not started and wait for the needed ones that are
+    /// running. A needed guess still queued (behind farther-ahead reads) is cancelled too:
+    /// its slot is released, so routing reads it now as a miss instead of waiting.
     /// Returns slots to release (cancelled or failed) and slots still being written.
     func settle(needed: Set<Int>) -> (release: [Int], inFlight: Set<Int>) {
         cond.lock()
         defer { cond.unlock() }
-        for (i, t) in targets.enumerated() where state[i] == .queued && !needed.contains(t.expert) {
+        for i in targets.indices where state[i] == .queued {
             state[i] = .cancelled
         }
         func pendingNeeded() -> Bool {
-            targets.indices.contains {
-                needed.contains(targets[$0].expert) && (state[$0] == .queued || state[$0] == .running)
-            }
+            targets.indices.contains { needed.contains(targets[$0].expert) && state[$0] == .running }
         }
         while pendingNeeded() { cond.wait() }
         var release: [Int] = []

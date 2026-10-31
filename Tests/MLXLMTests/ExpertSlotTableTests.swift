@@ -103,6 +103,24 @@ final class ExpertSlotTableTests: XCTestCase {
         XCTAssertEqual(table.occupant.compactMap { $0 }.sorted(), [1, 2, 5])
     }
 
+    /// A second, fresher guess for a layer must not overwrite slots an earlier guess is
+    /// still reading into, even though those keep an old lastUsed and look least recent.
+    func testClaimNeverEvictsReservedSlots() {
+        let table = makeTable(4)
+        table.beginToken()
+        _ = table.resolve([1, 2, 3, 4])
+        table.beginToken()
+        let first = table.claim([5, 6])
+        let second = table.claim([7, 8], reserved: Set(first.map(\.slot)))
+        XCTAssertTrue(Set(first.map(\.slot)).isDisjoint(with: second.map(\.slot)))
+        XCTAssertEqual(table.occupant.compactMap { $0 }.sorted(), [5, 6, 7, 8])
+    }
+
+    func testClaimStopsAtLimit() {
+        let table = makeTable(4)
+        XCTAssertEqual(table.claim([1, 2, 3], limit: 2).map(\.expert), [1, 2])
+    }
+
     func testReleasedSlotsBecomeMisses() {
         let table = makeTable(2)
         table.beginToken()
