@@ -586,7 +586,11 @@ class DeepseekV32DecoderLayer: Module {
             }
         }
         let r2 = mlp(postAttentionLayerNorm(h))
-        return (h + r2, topkIndices)
+        let out = h + r2
+        if SwitchGLU.pipelineDecode, h.dim(1) == 1, ExpertStreamingConfig.shared.isEnabled {
+            asyncEval(out)
+        }
+        return (out, topkIndices)
     }
 }
 

@@ -165,6 +165,15 @@ open class SwitchGLU: Module, @unchecked Sendable {
     public static let lookaheadMinLayer: Int =
         Int(ProcessInfo.processInfo.environment["MLX_MOE_PREFETCH_MIN_LAYER"] ?? "") ?? 7
 
+    /// Submit each decoder layer's output as soon as it is built during streaming decode,
+    /// so the GPU runs a layer's experts while the CPU builds the next layer's attention.
+    /// Otherwise that work waits for the next router's `asyncEval`. On by default;
+    /// `MLX_MOE_PIPELINE=0` disables.
+    public static let pipelineDecode: Bool = {
+        let v = ProcessInfo.processInfo.environment["MLX_MOE_PIPELINE"] ?? "1"
+        return v == "1" || v.lowercased() == "true"
+    }()
+
     /// True when MoE layers take the stacked streaming path, the only consumer of `lookahead`.
     public static var lookaheadActive: Bool {
         lookaheadTopK > 0 && useStackedBuffers && ExpertStreamingConfig.shared.isEnabled
