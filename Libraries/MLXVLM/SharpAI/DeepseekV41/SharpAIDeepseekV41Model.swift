@@ -343,7 +343,8 @@ public final class DeepseekV41Indexer: Module {
         let keys = indexK.asType(.float32)
         let weights =
             weightsProj(x).asType(.float32) * Float(pow(Double(numHeads), -0.5))
-        var scores = matmul(q.asType(.float32), keys.expandedDimensions(axis: 1).transposed(0, 1, 3, 2))
+        var scores = matmul(
+            q.asType(.float32), keys.expandedDimensions(axis: 1).transposed(0, 1, 3, 2))
         scores = maximum(scores, Float(0)) * Float(pow(Double(headDim), -0.5))
         scores = sum(scores * weights.expandedDimensions(axis: -1), axis: 2)  // [B, S, K]
 
@@ -362,7 +363,10 @@ public final class DeepseekV41Indexer: Module {
             var padded = scores
             if pad > 0 {
                 padded = concatenated(
-                    [scores, MLXArray.full([batch, length, pad], values: MLXArray(-Float.infinity))],
+                    [
+                        scores,
+                        MLXArray.full([batch, length, pad], values: MLXArray(-Float.infinity)),
+                    ],
                     axis: -1)
             }
             let blocks = padded.dim(-1) / block
@@ -384,8 +388,9 @@ public final class DeepseekV41Indexer: Module {
                 takeAlong(blockScores, chosen, axis: -1) .> MLXArray(-Float.infinity)
             var blockMask = MLXArray.zeros(blockScores.shape, type: Bool.self)
             blockMask = putAlong(blockMask, chosen, values: reachable, axis: -1)
-            candidatesOut = repeated(blockMask, count: block, axis: -1)[
-                .ellipsis, 0 ..< scores.dim(-1)]
+            candidatesOut =
+                repeated(blockMask, count: block, axis: -1)[
+                    .ellipsis, 0 ..< scores.dim(-1)]
         } else if let candidates {
             scores = which(candidates, scores, -Float.infinity)
         }
@@ -539,46 +544,35 @@ public final class DeepseekV41Attention: Module {
 
 // MARK: - MoE
 
-/// The routed experts (`switch_mlp`): gate, up and down projections over the selected experts.
-public final class DeepseekV41SwitchMLP: Module {
-    let limit: Float
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
-    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
+/// `deepseekV41ClampedSwiGLU` as one compiled dispatch, for `SwitchGLU`'s activation product.
+public func deepseekV41ClampedSwiGLUProduct(limit: Float)
+    -> @Sendable (MLXArray, MLXArray) -> MLXArray
+{
+    compile(shapeless: true) { gate, up in
+        deepseekV41ClampedSwiGLU(up: up, gate: gate, limit: limit)
+    }
+}
+
+/// The routed experts. `switch_mlp` is a `SwitchGLU`, so SSD streaming pages them in.
+public final class DeepseekV41Experts: Module {
+    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
 
     init(_ args: SharpAIDeepseekV41TextConfiguration) {
-        limit = args.swigluLimit
-        self._gateProj.wrappedValue = SwitchLinear(
-            inputDims: args.hiddenSize, outputDims: args.moeIntermediateSize,
-            numExperts: args.nRoutedExperts, bias: false)
-        self._upProj.wrappedValue = SwitchLinear(
-            inputDims: args.hiddenSize, outputDims: args.moeIntermediateSize,
-            numExperts: args.nRoutedExperts, bias: false)
-        self._downProj.wrappedValue = SwitchLinear(
-            inputDims: args.moeIntermediateSize, outputDims: args.hiddenSize,
-            numExperts: args.nRoutedExperts, bias: false)
+        let limit = args.swigluLimit
+        self._switchMLP.wrappedValue = SwitchGLU(
+            inputDims: args.hiddenSize, hiddenDims: args.moeIntermediateSize,
+            numExperts: args.nRoutedExperts,
+            activation: { silu(limit > 0 ? minimum($0, limit) : $0) },
+            activationProduct: deepseekV41ClampedSwiGLUProduct(limit: limit))
         super.init()
     }
 
     /// x [N, H], indices [N, k], weights [N, k] -> [N, H] (float32).
     func callAsFunction(_ x: MLXArray, indices: MLXArray, weights: MLXArray) -> MLXArray {
-        let expanded = x.expandedDimensions(axes: [-2, -3])  // [N, 1, 1, H]
-        let gate = gateProj(expanded, indices)  // [N, k, 1, I]
-        let up = upProj(expanded, indices)
-        let activated = deepseekV41ClampedSwiGLU(up: up, gate: gate, limit: limit)
-        let routed = downProj(activated, indices).squeezed(axis: -2)  // [N, k, H]
+        let routed = switchMLP(x, indices)  // [N, k, H]
         return sum(
             routed.asType(.float32) * weights.expandedDimensions(axis: -1).asType(.float32),
             axis: 1)
-    }
-}
-
-public final class DeepseekV41Experts: Module {
-    @ModuleInfo(key: "switch_mlp") var switchMLP: DeepseekV41SwitchMLP
-
-    init(_ args: SharpAIDeepseekV41TextConfiguration) {
-        self._switchMLP.wrappedValue = DeepseekV41SwitchMLP(args)
-        super.init()
     }
 }
 
@@ -629,19 +623,22 @@ public final class DeepseekV41Router: Module {
         super.init()
     }
 
-    /// x [N, H] -> (indices [N, k], weights [N, k])
-    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        var logits = matmul(x.asType(.float32), weight.asType(.float32).T)
-        logits = logits / gateTemp
-        let scores: MLXArray
+    /// x [N, H] -> scores [N, E] before the selection bias.
+    func scores(_ x: MLXArray) -> MLXArray {
+        let logits = matmul(x.asType(.float32), weight.asType(.float32).T) / gateTemp
         switch scoreFunc {
         case "sigmoid":
-            scores = sigmoid(logits)
+            return sigmoid(logits)
         case "softmax":
-            scores = softmax(logits, axis: -1)
+            return softmax(logits, axis: -1)
         default:
-            scores = sqrt(softplus(logits))
+            return sqrt(softplus(logits))
         }
+    }
+
+    /// x [N, H] -> (indices [N, k], weights [N, k])
+    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        let scores = scores(x)
         let biased = scores + eScoreCorrectionBias
         let chosen = argPartition(-biased, kth: topK - 1, axis: -1)[.ellipsis, 0 ..< topK]
         var weights = takeAlong(scores, chosen, axis: -1)
@@ -670,7 +667,7 @@ public final class DeepseekV41MoE: Module {
         let shape = x.shape
         let flat = x.reshaped(-1, dim)
         let (indices, weights) = gate(flat)
-        let routed = experts.switchMLP(flat, indices: indices, weights: weights)
+        let routed = experts(flat, indices: indices, weights: weights)
         let out = routed + sharedExperts(flat).asType(.float32)
         return out.reshaped(shape).asType(x.dtype)
     }
@@ -731,6 +728,9 @@ public final class DeepseekV41DecoderLayer: Module {
     @ModuleInfo(key: "ffn_hc") var ffnHC: DeepseekV41HyperConnection
     @ModuleInfo(key: "engram") var engram: DeepseekV41Engram?
     let layerId: Int
+    /// Later layers, nearest first, for expert prefetch during streaming decode
+    /// (`MLX_MOE_PREFETCH_TOPK`, `MLX_MOE_PREFETCH_DEPTH`).
+    var lookaheadLinks: [DeepseekV41LookaheadLink] = []
 
     init(_ args: SharpAIDeepseekV41TextConfiguration, layerId: Int) {
         self.layerId = layerId
@@ -764,14 +764,47 @@ public final class DeepseekV41DecoderLayer: Module {
             h, residual: streams, post: attnPost, comb: attnComb)
 
         let (ffnPre, ffnPost, ffnComb) = ffnHC(afterAttention)
-        let m = mlp(postAttentionLayernorm(deepseekV41Collapse(afterAttention, attnPre)))
+        let collapsed = deepseekV41Collapse(afterAttention, attnPre)
+        let decoding = collapsed.dim(1) == 1
+        if decoding, !lookaheadLinks.isEmpty, SwitchGLU.lookaheadActive {
+            mlp.experts.switchMLP.lookahead = lookaheadLinks.map {
+                ExpertLookahead(predicted: $0.predict(collapsed), target: $0.target)
+            }
+        }
+        let m = mlp(postAttentionLayernorm(collapsed))
         let out = deepseekV41Expand(m, residual: afterAttention, post: ffnPost, comb: ffnComb)
+        if decoding, SwitchGLU.pipelineDecode, ExpertStreamingConfig.shared.isEnabled {
+            asyncEval(out)
+        }
         return (out, ffnPre)
     }
 }
 
-public final class DeepseekV41TextModel: Module {
+/// Guesses a later layer's experts during streaming decode by running its router on this
+/// layer's collapsed hidden state, normalized with that layer's norm.
+final class DeepseekV41LookaheadLink {
+    let next: DeepseekV41DecoderLayer
+    let topK: Int
+
+    init(next: DeepseekV41DecoderLayer, topK: Int) {
+        self.next = next
+        self.topK = topK
+    }
+
+    var target: SwitchGLU { next.mlp.experts.switchMLP }
+
+    /// collapsed [B, 1, H] -> the guessed expert ids, flattened.
+    func predict(_ collapsed: MLXArray) -> MLXArray {
+        let router = next.mlp.gate
+        let x = next.postAttentionLayernorm(collapsed).reshaped(-1, collapsed.dim(-1))
+        let biased = router.scores(x) + router.eScoreCorrectionBias
+        return argPartition(-biased, kth: topK - 1, axis: -1)[.ellipsis, ..<topK].flattened()
+    }
+}
+
+public final class DeepseekV41TextModel: Module, StreamableMoE {
     let args: SharpAIDeepseekV41TextConfiguration
+    public var streamExperts = false
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     var layers: [DeepseekV41DecoderLayer]
     @ModuleInfo(key: "norm") var norm: RMSNorm
@@ -787,6 +820,17 @@ public final class DeepseekV41TextModel: Module {
         }
         self._norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
         super.init()
+
+        let k = min(SwitchGLU.lookaheadTopK, args.nRoutedExperts)
+        if k > 0 {
+            for i in layers.indices {
+                for j in (i + 1) ..< min(i + 1 + SwitchGLU.lookaheadDepth, layers.count)
+                where j >= SwitchGLU.lookaheadMinLayer {
+                    layers[i].lookaheadLinks.append(
+                        DeepseekV41LookaheadLink(next: layers[j], topK: k))
+                }
+            }
+        }
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [DeepseekV41LayerCache]) -> MLXArray {
@@ -948,6 +992,25 @@ extension SharpAIDeepseekV41Model: ModelDirectoryAttaching {
             tables[layerId] = table
         }
         model.engramRuntime = DeepseekV41EngramRuntime(hasher: hasher, tables: tables)
+    }
+}
+
+extension SharpAIDeepseekV41Model: UnstackedExpertNaming {
+    /// `model.layers.N.mlp.experts.switch_mlp.gate_proj` -> `layers.N.ffn.experts.E.w1.weight`
+    /// (w1 gate, w3 up, w2 down), the per-expert keys the sanitizer stacks.
+    public func unstackedExpertWeightKey(switchLinearPath path: String, expert: Int) -> String? {
+        let parts = path.split(separator: ".")
+        guard parts.count == 7, parts[0] == "model", parts[1] == "layers", Int(parts[2]) != nil,
+            parts[3] == "mlp", parts[4] == "experts", parts[5] == "switch_mlp"
+        else { return nil }
+        let projection: String
+        switch parts[6] {
+        case "gate_proj": projection = "w1"
+        case "up_proj": projection = "w3"
+        case "down_proj": projection = "w2"
+        default: return nil
+        }
+        return "layers.\(parts[2]).ffn.experts.\(expert).\(projection).weight"
     }
 }
 

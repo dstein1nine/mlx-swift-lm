@@ -1724,18 +1724,8 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
 
             // macOS directNVMe: resolve the safetensors shard + tensor offset once.
             // iOS mmapPageCache: ssdInfo = nil → falls through to mmap prefault below.
-            let ssdInfo: (path: String, tensorName: String)? = {
-                #if os(macOS)
-                guard ExpertStreamingConfig.shared.useDirectNVMe,
-                      let tName = self.tensorName,
-                      let filename = ExpertStreamerManager.shared?.getFile(for: tName),
-                      let dir = ExpertStreamingConfig.shared.modelDirectory else { return nil }
-                let path = dir.appendingPathComponent(filename).path
-                return (path, tName)
-                #else
-                return nil  // iOS always uses mmap fallback
-                #endif
-            }()
+            // Covers per-expert (unstacked) tensors too; iOS gets nil and uses the mmap fallback.
+            let ssdInfo = self.resolveSSDInfo()
 
             // ---- Parse expert ranges ----
             var ranges = [ExpertRange]()

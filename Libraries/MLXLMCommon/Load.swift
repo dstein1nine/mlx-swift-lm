@@ -576,7 +576,30 @@ public func loadWeights(
         for (path, module) in model.leafModules().flattened() {
             if let sl = module as? SwitchLinear {
                 let bareName = "\(path).weight"
-                
+
+                // Checkpoints that name each expert's tensor their own way (DeepSeek V4.1's
+                // `layers.N.ffn.experts.E.w1`) say so through the model.
+                if let naming = model as? any UnstackedExpertNaming,
+                    let dir = ExpertStreamingConfig.shared.modelDirectory,
+                    let manager = ExpertStreamerManager.shared,
+                    naming.unstackedExpertWeightKey(switchLinearPath: path, expert: 0) != nil
+                {
+                    var map = [Int: (path: String, tensorName: String)]()
+                    for i in 0 ..< sl.numExperts {
+                        guard
+                            let key = naming.unstackedExpertWeightKey(
+                                switchLinearPath: path, expert: i),
+                            let file = manager.getFile(for: key)
+                        else { continue }
+                        map[i] = (dir.appendingPathComponent(file).path, key)
+                    }
+                    if map.count == sl.numExperts {
+                        sl.unstackedSSDMap = map
+                        continue
+                    }
+                    print("[Load] WARNING: \(map.count) of \(sl.numExperts) expert tensors of \(path) are in the shard index.")
+                }
+
                 // First, check for unstacked format (e.g. Qwen FP8: "experts.N.gate_proj")
                 if bareName.contains(".switch_mlp.") {
                     let unstackedBaseName = bareName.replacingOccurrences(of: ".switch_mlp.", with: ".experts.")
@@ -667,6 +690,13 @@ public func loadWeights(
 /// `loadWeights` calls `attach` after applying the weights it does load.
 public protocol ModelDirectoryAttaching {
     func attach(modelDirectory: URL) throws
+}
+
+/// A model whose checkpoint stores each expert's weight as its own tensor, under names the
+/// `.switch_mlp.` -> `.experts.N.` rewrite does not produce. SSD streaming reads expert `expert`
+/// of the stacked `SwitchLinear` at `path` from the returned key; nil leaves the default lookup.
+public protocol UnstackedExpertNaming {
+    func unstackedExpertWeightKey(switchLinearPath path: String, expert: Int) -> String?
 }
 
 /// Read every non-expert weight of an SSD-streaming model into memory before serving.
