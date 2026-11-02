@@ -63,4 +63,24 @@ final class SharpAIDeepseekV41SanitizeTests: XCTestCase {
 
         XCTAssertEqual(Set(result.keys), [kept])
     }
+
+    /// An MLX-quantized checkpoint stores each expert's `scales` and `biases` next to its packed
+    /// `weight`; all three stack into `switch_mlp`, so the quantized layer finds them.
+    func testStacksQuantizedExpertScalesAndBiases() {
+        var weights: [String: MLXArray] = [:]
+        for expert in 0 ..< 2 {
+            for kind in ["weight", "scales", "biases"] {
+                weights["layers.3.ffn.experts.\(expert).w2.\(kind)"] = vector(Float(expert))
+            }
+        }
+
+        let result = SharpAIDeepseekV41Sanitizer.toModuleKeys(weights, numExperts: 2)
+
+        for kind in ["weight", "scales", "biases"] {
+            let stackedTensor = result["model.layers.3.mlp.experts.switch_mlp.down_proj.\(kind)"]
+            XCTAssertEqual(stackedTensor?.shape, [2, 2], kind)
+            XCTAssertEqual(stackedTensor?[1, 0].item(Float.self), 1, kind)
+        }
+        XCTAssertEqual(result.count, 3)
+    }
 }

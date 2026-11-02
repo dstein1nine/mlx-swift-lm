@@ -264,7 +264,8 @@ public struct SharpAIDeepseekV41Configuration: Decodable, Sendable, ModelConfigu
     public let textModelType: String?
     /// The vision sub-model type, expected to be "deepseek_v41_vision" (checkpoint vision_config).
     public let visionModelType: String?
-    /// Full text_config fields. Nil when the checkpoint has no text_config section.
+    /// Full text_config fields, or the top-level fields of a flattened MLX config. Nil when
+    /// neither is present.
     public let text: SharpAIDeepseekV41TextConfiguration?
 
     enum CodingKeys: String, CodingKey {
@@ -272,6 +273,11 @@ public struct SharpAIDeepseekV41Configuration: Decodable, Sendable, ModelConfigu
         case architectures
         case textConfig = "text_config"
         case visionConfig = "vision_config"
+    }
+
+    /// Marks a flattened config: its text fields sit at the top level.
+    private enum FlatTextKeys: String, CodingKey {
+        case hiddenSize = "hidden_size"
     }
 
     private struct SubConfig: Decodable {
@@ -290,7 +296,15 @@ public struct SharpAIDeepseekV41Configuration: Decodable, Sendable, ModelConfigu
         architectures = try c.decodeIfPresent([String].self, forKey: .architectures) ?? []
         textModelType = try c.decodeIfPresent(SubConfig.self, forKey: .textConfig)?.modelType
         visionModelType = try c.decodeIfPresent(SubConfig.self, forKey: .visionConfig)?.modelType
-        text = try c.decodeIfPresent(SharpAIDeepseekV41TextConfiguration.self, forKey: .textConfig)
+        if c.contains(.textConfig) {
+            text = try c.decode(SharpAIDeepseekV41TextConfiguration.self, forKey: .textConfig)
+        } else if try decoder.container(keyedBy: FlatTextKeys.self).contains(.hiddenSize) {
+            // MLX conversions (mlx-community/DeepSeek-V4.1-Flash-MLX-4bit) flatten the text
+            // fields into the top level, next to model_type.
+            text = try SharpAIDeepseekV41TextConfiguration(from: decoder)
+        } else {
+            text = nil
+        }
     }
 
     public func validateModelConfiguration() throws {

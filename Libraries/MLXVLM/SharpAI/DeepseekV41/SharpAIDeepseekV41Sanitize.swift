@@ -27,7 +27,8 @@ public enum SharpAIDeepseekV41Sanitizer {
     }
 
     /// Maps checkpoint names to the module keys of `SharpAIDeepseekV41Model`: drops, renames,
-    /// and stacks the per-expert `ffn.experts.E.wK` weights into `switch_mlp` [E, out, in] tensors.
+    /// and stacks the per-expert `ffn.experts.E.wK` weights into `switch_mlp` [E, out, in] tensors
+    /// (and, for an MLX-quantized checkpoint, their `scales` and `biases` the same way).
     /// A converted checkpoint (keys that already start with `model.`) is returned unchanged.
     public static func toModuleKeys(
         _ weights: [String: MLXArray], numExperts: Int
@@ -36,7 +37,7 @@ public enum SharpAIDeepseekV41Sanitizer {
             return weights
         }
         var clean: [String: MLXArray] = [:]
-        // group "layer|proj" -> expert index -> (raw key, weight)
+        // group "layer|proj|kind" -> expert index -> (raw key, tensor)
         var experts: [String: [Int: (key: String, value: MLXArray)]] = [:]
         var expertModuleKey: [String: String] = [:]
         for (key, value) in sanitize(weights) {
@@ -45,12 +46,12 @@ public enum SharpAIDeepseekV41Sanitizer {
                 continue
             }
             if let expert = parseExpertKey(key) {
-                let group = "\(expert.layer)|\(expert.proj)"
+                let group = "\(expert.layer)|\(expert.proj)|\(expert.kind)"
                 experts[group, default: [:]][expert.index] = (key, value)
                 let projName =
                     expert.proj == "w1" ? "gate_proj" : (expert.proj == "w2" ? "down_proj" : "up_proj")
                 expertModuleKey[group] =
-                    "model.layers.\(expert.layer).mlp.experts.switch_mlp.\(projName).weight"
+                    "model.layers.\(expert.layer).mlp.experts.switch_mlp.\(projName).\(expert.kind)"
                 continue
             }
             clean[renameKey(key)] = value
@@ -70,16 +71,19 @@ public enum SharpAIDeepseekV41Sanitizer {
         return clean
     }
 
-    /// `layers.L.ffn.experts.E.wK.weight` -> (L, E, "wK"); nil for any other key.
-    private static func parseExpertKey(_ key: String) -> (layer: Int, index: Int, proj: String)? {
+    /// `layers.L.ffn.experts.E.wK.{weight,scales,biases}` -> (L, E, "wK", kind); nil for any
+    /// other key.
+    private static func parseExpertKey(
+        _ key: String
+    ) -> (layer: Int, index: Int, proj: String, kind: String)? {
         let parts = key.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 7, parts[0] == "layers", parts[2] == "ffn", parts[3] == "experts",
-            parts[6] == "weight", ["w1", "w2", "w3"].contains(parts[5]),
+            ["weight", "scales", "biases"].contains(parts[6]), ["w1", "w2", "w3"].contains(parts[5]),
             let layer = Int(parts[1]), let index = Int(parts[4])
         else {
             return nil
         }
-        return (layer, index, parts[5])
+        return (layer, index, parts[5], parts[6])
     }
 
     /// Map one checkpoint name to its module name (`_rename` in mlx-lm deepseek_v41.py).

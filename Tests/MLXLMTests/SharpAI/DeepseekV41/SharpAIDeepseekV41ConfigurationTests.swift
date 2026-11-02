@@ -26,6 +26,27 @@ final class SharpAIDeepseekV41ConfigurationTests: XCTestCase {
         XCTAssertEqual(config.visionModelType, "deepseek_v41_vision")
     }
 
+    /// MLX conversions put the text fields at the top level instead of under text_config.
+    func testFlattenedMLXConfigDecodesTextFields() throws {
+        let json = """
+            {
+                "model_type": "deepseek_v41",
+                "hidden_size": 5120,
+                "n_routed_experts": 384,
+                "engram_layer_ids": [1, 14],
+                "vision_config": { "model_type": "deepseek_v41_vision" }
+            }
+            """
+        let config = try JSONDecoder.json5().decode(
+            SharpAIDeepseekV41Configuration.self, from: Data(json.utf8))
+
+        let text = try XCTUnwrap(config.text)
+        XCTAssertEqual(text.hiddenSize, 5120)
+        XCTAssertEqual(text.nRoutedExperts, 384)
+        XCTAssertEqual(text.engramLayerIds, [1, 14])
+        XCTAssertNil(config.textModelType)
+    }
+
     func testMissingFieldsUseDefaults() throws {
         let config = try JSONDecoder.json5().decode(
             SharpAIDeepseekV41Configuration.self, from: Data("{}".utf8))
