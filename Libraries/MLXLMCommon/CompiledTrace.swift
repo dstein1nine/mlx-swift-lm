@@ -4,59 +4,6 @@ import Foundation
 import MLX
 import MLXNN
 
-// MLX traces a compiled function once. Any MLXArray the body reads but does not
-// take as an argument becomes a constant of that trace, so weights read through
-// a captured module freeze at the values of the first call. Plain inference
-// never notices. An adapter load, fuse, or unload, or a training step, keeps
-// producing the old weights.
-//
-// The `compile` overloads below shadow MLX's stateless ones with a `@Sendable`
-// body. `MLXArray` and `Module` are not `Sendable`, so that capture no longer
-// builds. Bodies that read weights use `CompiledTrace`, which declares them as
-// compile state.
-//
-// `MLX.compile(inputs:outputs:)` is untouched: declaring captured state there
-// is correct, and it remains the way to compile a training step.
-
-/// Compiles a function that reads nothing but its arguments.
-///
-/// Shadows MLX's `compile` with a `@Sendable` body, which cannot capture an
-/// `MLXArray` or a `Module`. Use ``CompiledTrace`` for a body that has to read
-/// module weights.
-public func compile(
-    shapeless: Bool = false,
-    _ body: @escaping @Sendable ([MLXArray]) -> [MLXArray]
-) -> @Sendable ([MLXArray]) -> [MLXArray] {
-    MLX.compile(shapeless: shapeless, body)
-}
-
-/// Overload of ``compile(shapeless:_:)-(Bool,([MLXArray])->[MLXArray])`` for one input and one
-/// output.
-public func compile(
-    shapeless: Bool = false,
-    _ body: @escaping @Sendable (MLXArray) -> MLXArray
-) -> @Sendable (MLXArray) -> MLXArray {
-    MLX.compile(shapeless: shapeless, body)
-}
-
-/// Overload of ``compile(shapeless:_:)-(Bool,([MLXArray])->[MLXArray])`` for two inputs and one
-/// output.
-public func compile(
-    shapeless: Bool = false,
-    _ body: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray
-) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
-    MLX.compile(shapeless: shapeless, body)
-}
-
-/// Overload of ``compile(shapeless:_:)-(Bool,([MLXArray])->[MLXArray])`` for three inputs and one
-/// output.
-public func compile(
-    shapeless: Bool = false,
-    _ body: @escaping @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray
-) -> @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray {
-    MLX.compile(shapeless: shapeless, body)
-}
-
 /// A compiled trace of a body that reads module weights.
 ///
 /// The declared modules' weights become compile `inputs:`, so every call reads

@@ -30,6 +30,9 @@ public struct Gemma3TextConfiguration: Codable {
     let slidingWindowPattern: Int
     let maxPositionEmbeddings: Int
     let ropeScaling: [String: StringOrNumber]?
+    /// `final_logit_softcapping`: when set, logits become `cap * tanh(logits / cap)`.
+    /// `nil` (the default, and the original Gemma 3 behaviour) leaves logits unbounded.
+    let finalLogitSoftcapping: Float?
 
     /// Creates a configuration for a small model with the given
     /// `vocabularySize`.  This is suitable for creating random
@@ -80,7 +83,8 @@ public struct Gemma3TextConfiguration: Codable {
         attentionHeads: Int, headDim: Int, rmsNormEps: Float, vocabularySize: Int, kvHeads: Int,
         ropeTheta: Float, ropeLocalBaseFreq: Float, ropeTraditional: Bool,
         queryPreAttnScalar: Float, slidingWindow: Int, slidingWindowPattern: Int,
-        maxPositionEmbeddings: Int, ropeScaling: [String: StringOrNumber]? = nil
+        maxPositionEmbeddings: Int, ropeScaling: [String: StringOrNumber]? = nil,
+        finalLogitSoftcapping: Float? = nil
     ) {
         self.modelType = modelType
         self.hiddenSize = hiddenSize
@@ -99,6 +103,7 @@ public struct Gemma3TextConfiguration: Codable {
         self.slidingWindowPattern = slidingWindowPattern
         self.maxPositionEmbeddings = maxPositionEmbeddings
         self.ropeScaling = ropeScaling
+        self.finalLogitSoftcapping = finalLogitSoftcapping
     }
 
     enum CodingKeys: String, CodingKey {
@@ -119,10 +124,17 @@ public struct Gemma3TextConfiguration: Codable {
         case slidingWindowPattern = "sliding_window_pattern"
         case maxPositionEmbeddings = "max_position_embeddings"
         case ropeScaling = "rope_scaling"
+        case finalLogitSoftcapping = "final_logit_softcapping"
     }
 
     enum VLMCodingKeys: String, CodingKey {
         case textConfig = "text_config"
+    }
+
+    // Kept out of `CodingKeys` so the synthesized `Encodable` is unchanged.
+    private enum RopeParametersCodingKeys: String, CodingKey {
+        case textConfig = "text_config"
+        case ropeParameters = "rope_parameters"
     }
 
     public init(from decoder: Decoder) throws {
@@ -162,6 +174,30 @@ public struct Gemma3TextConfiguration: Codable {
             try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
         ropeScaling =
             try container.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeScaling)
+            ?? Self.fullAttentionRopeParameters(from: decoder)
+        finalLogitSoftcapping =
+            try container.decodeIfPresent(Float.self, forKey: .finalLogitSoftcapping)
+    }
+
+    /// Newer `transformers` exports set `rope_scaling` to null and write `rope_parameters`
+    /// instead, either keyed by layer type or flat.
+    private static func fullAttentionRopeParameters(
+        from decoder: Decoder
+    ) -> [String: StringOrNumber]? {
+        guard var container = try? decoder.container(keyedBy: RopeParametersCodingKeys.self)
+        else { return nil }
+        if let textConfig = try? container.nestedContainer(
+            keyedBy: RopeParametersCodingKeys.self, forKey: .textConfig)
+        {
+            container = textConfig
+        }
+        if let byLayerType = try? container.decodeIfPresent(
+            [String: [String: StringOrNumber]].self, forKey: .ropeParameters)
+        {
+            return byLayerType["full_attention"]
+        }
+        return try? container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeParameters)
     }
 }
 
@@ -413,6 +449,9 @@ public class Gemma3TextModel: Module, LLMModel {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var out = model(inputs, mask: nil, cache: cache)
         out = lmHead(out)
+        if let cap = config.finalLogitSoftcapping, cap > 0 {
+            out = tanh(out / cap) * cap
+        }
         return out
     }
 

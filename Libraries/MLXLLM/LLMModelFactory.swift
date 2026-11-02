@@ -102,7 +102,6 @@ public enum LLMTypeRegistry {
         // the same Swift model rather than getting a parallel implementation.
         "deepseek_v3_2": create(DeepseekV32Configuration.self, DeepseekV32Model.init),
         "glm_moe_dsa": create(DeepseekV32Configuration.self, DeepseekV32Model.init),
-        "deepseek_v4": create(DeepseekV4Configuration.self, DeepseekV4Model.init),
         "granite": create(GraniteConfiguration.self, GraniteModel.init),
         "helium": create(HeliumConfiguration.self, HeliumModel.init),
         "granitemoehybrid": create(
@@ -131,6 +130,7 @@ public enum LLMTypeRegistry {
         "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
         "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
+        "nemotron_h_puzzle": create(NemotronHConfiguration.self, NemotronHModel.init),
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
         "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
         "jamba": create(JambaConfiguration.self, JambaModel.init),
@@ -160,7 +160,11 @@ public enum LLMTypeRegistry {
         "hunyuan_v1_dense": create(HunyuanConfiguration.self, HunyuanModel.init),
         "nemotron_labs_diffusion": create(
             NemotronLabsDiffusionConfiguration.self, NemotronLabsDiffusionModel.init),
-    ])
+    ]
+    // SharpAI: SL-50 overlays, UPSTREAM WINS -- a key the literal above registers keeps its creator.
+    .merging(SharpAIModelOverlays.llm, uniquingKeysWith: SharpAIModelOverlays.upstreamWins)
+    // SharpAI: ours wins (SL-41). Keep this merge last so no other merge can override deepseek_v4.
+    .merging(SharpAIDeepseekV4Overlay.creators) { _, ours in ours })
 }
 
 /// Registry of models and any overrides that go with them, e.g. prompt augmentation.

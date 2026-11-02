@@ -391,17 +391,21 @@ public func makeAttentionMask(
 
 /// Create an attention mask using the parameters from the KVCache.
 ///
+/// The mask is sized by the cache, so it spans the keys the cache still
+/// presents: an evicting cache drops rows the absolute offset would include.
+///
 /// See also `MultiHeadAttention.createAdditiveCausalMask(_:dtype:)` -- same idea
 /// but doesn't honor the cache offset.
 @_disfavoredOverload
 public func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
     let t = h.dim(1)
     if t > 1 {
-        var offset = 0
-        if let c = cache?.first {
-            offset = c.offset
+        if case .array(let mask) = createAttentionMask(
+            h: h, cache: cache?.first, returnArray: true)
+        {
+            return mask
         }
-        return createCausalMask(n: t, offset: offset)
+        return createCausalMask(n: t, offset: 0)
     }
     return nil
 }
@@ -413,29 +417,7 @@ public func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
 public func createAttentionMask(h: MLXArray, cache: [KVCache]?, returnArray: Bool = false)
     -> MLXFast.ScaledDotProductAttentionMaskMode
 {
-    let t = h.dim(1)
-    if t > 1 {
-        var returnArray = returnArray
-        var offset = 0
-        var windowSize: Int? = nil
-        if let c = cache?.first {
-            offset = c.offset
-            if let maxSize = c.maxSize {
-                windowSize = maxSize
-                offset = min(maxSize - 1, offset)
-                if !returnArray {
-                    returnArray = offset + t > maxSize
-                }
-            }
-        }
-
-        if returnArray {
-            return .array(createCausalMask(n: t, offset: offset, windowSize: windowSize))
-        } else {
-            return .causal
-        }
-    }
-    return .none
+    createAttentionMask(h: h, cache: cache?.first, returnArray: returnArray)
 }
 
 /// Create an attention mask with explicit window size parameter.
@@ -2214,10 +2196,20 @@ public class CacheList: BaseKVCache {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        // SharpAI overlay (SL-37): an auxiliary child with a bounded rewind (V4CompressorStateCache) cannot follow a
+        // larger trim; clamp to it so the other children do not rewind further than it does and drift apart.
+        var n = n
+        var bounded = false
+        for cache in caches where cache is any AuxiliaryKVCache && cache.isTrimmable {
+            n = Swift.min(n, cache.maxTrimCount)
+            bounded = true
+        }
+        n = Swift.max(n, 0)
         var result = 0
         for cache in caches {
             result = cache.trim(n)
         }
+        if bounded { offset = Swift.max(0, offset - result) }
         return result
     }
 
@@ -3075,7 +3067,7 @@ func maybeVarianceNormalizeKVCache(
 // MARK: - Attention Helpers
 
 /// Apply a symbolic or array attention mask to score logits.
-func applyAttentionMask(
+package func applyAttentionMask(
     scores: MLXArray,
     mask: MLXFast.ScaledDotProductAttentionMaskMode
 ) -> MLXArray {

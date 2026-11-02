@@ -109,8 +109,7 @@ let package = Package(
             ],
             path: "Libraries/MLXVLM",
             exclude: [
-                "README.md",
-                "Models/test_features.patch"
+                "README.md"
             ]
         ),
         .target(
@@ -203,7 +202,15 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                // KDA golden fixtures: read through #filePath by ConformanceKdaGoldenTests, never as bundle resources.
+                "Conformance/Golden/kda",
+                // SwiGLU golden fixtures: same, read through #filePath by ConformanceSwigluGoldenTests.
+                "Conformance/Golden/swiglu",
+                // V4 compressor / indexer / routing golden fixtures: same, read through #filePath by the V4 golden suites.
+                "Conformance/Golden/v4comp",
+                "Conformance/Golden/v4idx",
+                "Conformance/Golden/v4route",
             ],
             resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
         ),
@@ -353,6 +360,7 @@ let package = Package(
                 "MLXGuidedGeneration",
                 "MLXLMCommon",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
             ],
             path: "Tests/MLXGuidedGenerationTests"
         ),

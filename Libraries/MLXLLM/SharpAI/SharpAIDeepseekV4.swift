@@ -1,0 +1,1078 @@
+// Copyright © 2025 Apple Inc.
+
+// Port of DeepSeek-V4 inference code
+// Reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro
+
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXNN
+
+// MARK: - Configuration
+
+public struct SharpAIDeepseekV4Configuration: Codable, Sendable {
+    // Core architecture
+    var vocabSize: Int
+    var hiddenSize: Int
+    var moeIntermediateSize: Int
+    var numHiddenLayers: Int
+    var numAttentionHeads: Int
+    var headDim: Int
+    var qLoraRank: Int
+    var qkRopeHeadDim: Int
+    var rmsNormEps: Float
+
+    // Output projection grouping
+    var oGroups: Int
+    var oLoraRank: Int
+
+    // Attention / compression (per layer)
+    var slidingWindow: Int
+    var compressRatios: [Int]
+    var compressRopeTheta: Float
+
+    // MoE
+    var nRoutedExperts: Int
+    var nSharedExperts: Int
+    var numExpertsPerTok: Int
+    var scoringFunc: String
+    var routedScalingFactor: Float
+    var swiguLimit: Float
+    var numHashLayers: Int
+    var numNextnPredictLayers: Int
+    var normTopkProb: Bool
+
+    // Hyper-Connections (mHC)
+    var hcMult: Int
+    var hcSinkhornIters: Int
+    var hcEps: Float
+
+    // RoPE
+    var ropeTheta: Float
+    var ropeScaling: [String: StringOrNumber]?
+    var maxPositionEmbeddings: Int
+
+    // Sparse indexer shape and quantization metadata (optional; absent in older configs)
+    var indexHeadDim: Int? = nil
+    var indexNHeads: Int? = nil
+    var indexTopk: Int? = nil
+    var expertDtype: String? = nil
+    var quantizationConfig: [String: JSONValue]? = nil
+
+    // Nope head dim (derived)
+    var nopeHeadDim: Int { headDim - qkRopeHeadDim }
+
+    enum CodingKeys: String, CodingKey {
+        case vocabSize = "vocab_size"
+        case hiddenSize = "hidden_size"
+        case moeIntermediateSize = "moe_intermediate_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case numAttentionHeads = "num_attention_heads"
+        case headDim = "head_dim"
+        case qLoraRank = "q_lora_rank"
+        case qkRopeHeadDim = "qk_rope_head_dim"
+        case rmsNormEps = "rms_norm_eps"
+        case oGroups = "o_groups"
+        case oLoraRank = "o_lora_rank"
+        case slidingWindow = "sliding_window"
+        case compressRatios = "compress_ratios"
+        case compressRopeTheta = "compress_rope_theta"
+        case nRoutedExperts = "n_routed_experts"
+        case nSharedExperts = "n_shared_experts"
+        case numExpertsPerTok = "num_experts_per_tok"
+        case scoringFunc = "scoring_func"
+        case routedScalingFactor = "routed_scaling_factor"
+        case swiguLimit = "swiglu_limit"
+        case numHashLayers = "num_hash_layers"
+        case numNextnPredictLayers = "num_nextn_predict_layers"
+        case normTopkProb = "norm_topk_prob"
+        case hcMult = "hc_mult"
+        case hcSinkhornIters = "hc_sinkhorn_iters"
+        case hcEps = "hc_eps"
+        case ropeTheta = "rope_theta"
+        case ropeScaling = "rope_scaling"
+        case maxPositionEmbeddings = "max_position_embeddings"
+        case indexHeadDim = "index_head_dim"
+        case indexNHeads = "index_n_heads"
+        case indexTopk = "index_topk"
+        case expertDtype = "expert_dtype"
+        case quantizationConfig = "quantization_config"
+    }
+}
+
+// MARK: - Helper Functions
+
+/// sqrtsoftplus activation: sqrt(softplus(x)) = sqrt(log(1 + e^x))
+/// Uses numerically stable form to avoid exp overflow for large positive x.
+private func sqrtSoftplus(_ x: MLXArray) -> MLXArray {
+    let sp = MLX.maximum(x, MLXArray(0)) + MLX.log1p(MLX.exp(-MLX.abs(x)))
+    return MLX.sqrt(sp)
+}
+
+/// Apply per-head RMS normalization (without learnable scale)
+private func headRmsNorm(_ x: MLXArray, eps: Float) -> MLXArray {
+    x * rsqrt(x.square().mean(axis: -1, keepDims: true) + eps)
+}
+
+// MARK: - Sinkhorn-based Hyper-Connection helpers
+
+/// Split mixes into (pre, post, comb) with Sinkhorn normalization.
+/// mixes: [B, S, mix_hc] where mix_hc = (2+hc)*hc
+/// Returns pre [B,S,hc], post [B,S,hc], comb [B,S,hc,hc]
+///
+/// Maths as vLLM `mhc_pre_torch` (vllm/model_executor/kernels/mhc/torch.py:108-123; the same in
+/// tests/kernels/mhc/test_mhc_kernels.py `sinkhorn_normalize_ref` / `mhc_pre_ref`):
+///   pre  = sigmoid(mix * scale[0] + base) + eps                 (not normalised)
+///   post = sigmoid(mix * scale[1] + base) * 2.0                 (hc_post_alpha, models/deepseek_v4/cpu/model.py:263)
+///   comb = softmax(mix * scale[2] + base, last axis) + eps; comb /= colsum(comb) + eps;
+///          then (iters - 1) times: comb /= rowsum(comb) + eps; comb /= colsum(comb) + eps
+func sharpAIHCSplitSinkhorn(
+    _ mixes: MLXArray,
+    hcScale: MLXArray,    // [3]
+    hcBase: MLXArray,     // [mix_hc]
+    hcMult: Int,
+    sinkhornIters: Int,
+    eps: Float
+) -> (MLXArray, MLXArray, MLXArray) {
+    let hc = hcMult
+    let B = mixes.dim(0), S = mixes.dim(1)
+
+    // Split mixes into 3 parts
+    let preMix = mixes[.ellipsis, ..<hc]            // [B, S, hc]
+    let postMix = mixes[.ellipsis, hc ..< 2 * hc]   // [B, S, hc]
+    let combMix = mixes[.ellipsis, (2 * hc)...]      // [B, S, hc*hc]
+
+    // Per-part scale, per-element base
+    let preBase = hcBase[..<hc]
+    let postBase = hcBase[hc ..< 2 * hc]
+    let combBase = hcBase[(2 * hc)...]
+
+    let pre = sigmoid(preMix * hcScale[0] + preBase) + eps
+    let post = sigmoid(postMix * hcScale[1] + postBase) * Float(2)
+    let combLogits = (combMix * hcScale[2] + combBase).reshaped(B, S, hc, hc)
+    var comb = softmax(combLogits, axis: -1) + eps
+
+    comb = comb / (comb.sum(axis: -2, keepDims: true) + eps)  // column normalize
+    if sinkhornIters > 1 {
+        for _ in 0 ..< (sinkhornIters - 1) {
+            comb = comb / (comb.sum(axis: -1, keepDims: true) + eps)  // row normalize
+            comb = comb / (comb.sum(axis: -2, keepDims: true) + eps)  // column normalize
+        }
+    }
+
+    return (pre, post, comb)
+}
+
+/// Hyper-Connection pre-step: reduce [B,S,hc,D] → [B,S,D] with Sinkhorn weights.
+/// Returns (reduced_x, post_weights, comb_matrix).
+func sharpAIHCPre(
+    x: MLXArray,           // [B, S, hc, D]
+    hcFn: MLXArray,        // [mix_hc, hc*D]
+    hcScale: MLXArray,     // [3]
+    hcBase: MLXArray,      // [mix_hc]
+    hcMult: Int,
+    sinkhornIters: Int,
+    rmsEps: Float,         // model rms_norm_eps: RMS scale (vLLM cpu/model.py:327)
+    eps: Float             // hc_eps: pre / sinkhorn eps (cpu/model.py:328-329)
+) -> (MLXArray, MLXArray, MLXArray) {
+    let dtype = x.dtype
+    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
+
+    // Flatten: [B, S, hc*D]
+    let xFlat = x.reshaped(B, S, hc * D).asType(.float32)
+
+    // RMS-style normalization scale
+    let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + rmsEps)
+
+    // Linear projection: [B, S, mix_hc]
+    let mixes = matmul(xFlat, hcFn.T) * normScale
+
+    let (pre, post, comb) = sharpAIHCSplitSinkhorn(
+        mixes, hcScale: hcScale, hcBase: hcBase,
+        hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
+
+    // Weighted sum of hc copies: [B, S, D]
+    let y = (pre.expandedDimensions(axis: -1).asType(dtype) * x).sum(axis: -2)
+
+    return (y, post, comb)
+}
+
+/// Hyper-Connection post-step: expand sublayer output back to [B,S,hc,D].
+/// y[b,s,j,:] = post[b,s,j]*x[b,s,:] + sum_i(comb[b,s,i,j]*residual[b,s,i,:])
+func sharpAIHCPost(
+    x: MLXArray,        // [B, S, D] - sublayer output
+    residual: MLXArray, // [B, S, hc, D] - input to this block
+    post: MLXArray,     // [B, S, hc]
+    comb: MLXArray      // [B, S, hc, hc]
+) -> MLXArray {
+    // term1: post[b,s,j] * x[b,s,:] → broadcast to [B,S,hc,D]
+    let term1 = post.expandedDimensions(axis: -1) * x.expandedDimensions(axis: -2)
+
+    // term2: sum_i(comb[b,s,i,j] * residual[b,s,i,:])
+    // comb.unsqueeze(-1): [B,S,hc_i,hc_j,1]
+    // residual.unsqueeze(-2): [B,S,hc_i,1,D]
+    // product: [B,S,hc_i,hc_j,D] → sum over dim 2 → [B,S,hc_j,D]
+    let combExp = comb.expandedDimensions(axis: -1)         // [B,S,hc,hc,1]
+    let residualExp = residual.expandedDimensions(axis: -2) // [B,S,hc,1,D]
+    let term2 = (combExp * residualExp).sum(axis: 2)        // [B,S,hc,D]
+
+    return (term1 + term2).asType(x.dtype)
+}
+
+// MARK: - SharpAIHCParams Module
+
+/// Lightweight Module to hold the three Hyper-Connection tensors loaded from checkpoint.
+/// Key names (fn, base, scale) match the `hc_attn.*` / `hc_ffn.*` / `hc_head.*` paths.
+class SharpAIHCParams: Module {
+    var fn: MLXArray
+    var base: MLXArray
+    var scale: MLXArray
+
+    init(fn: MLXArray, base: MLXArray, scale: MLXArray) {
+        self.fn = fn
+        self.base = base
+        self.scale = scale
+    }
+}
+
+/// Final HC head: reduce [B,S,hc,D] → [B,S,D] for lm_head.
+/// No Sinkhorn – just sigmoid + eps weighted sum.
+func sharpAIHCHead(
+    x: MLXArray,        // [B, S, hc, D]
+    hcFn: MLXArray,     // [hc, hc*D]
+    hcScale: MLXArray,  // [1]
+    hcBase: MLXArray,   // [hc]
+    rmsEps: Float,      // model rms_norm_eps (vLLM cpu/model.py:619-626)
+    eps: Float          // hc_eps
+) -> MLXArray {
+    let dtype = x.dtype
+    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
+
+    let xFlat = x.reshaped(B, S, hc * D).asType(.float32)
+    let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + rmsEps)
+    let mixes = matmul(xFlat, hcFn.T) * normScale           // [B, S, hc]
+    let pre = sigmoid(mixes * hcScale + hcBase) + eps        // [B, S, hc]
+
+    // Weighted sum: [B, S, D]
+    let y = (pre.expandedDimensions(axis: -1).asType(dtype) * x).sum(axis: -2)
+    return y.asType(dtype)
+}
+
+// MARK: - Attention
+
+/// Attention with cache update that optionally applies per-head sink bias.
+/// Mirrors `attentionWithCacheUpdateAndSinks` from MiMoV2Flash but uses the public API.
+private func deepseekAttentionWithSinks(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    cache: KVCache?,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    sinks: MLXArray?
+) -> MLXArray {
+    guard let cache else {
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values,
+            scale: scale, mask: mask, sinks: sinks)
+    }
+    if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+        precondition(sinks == nil, "Quantized SDPA does not support attention sinks.")
+        let (qk, qv) = quantizedKVCache.updateQuantized(keys: keys, values: values)
+        return quantizedScaledDotProductAttention(
+            queries: queries,
+            quantizedKeys: qk, quantizedValues: qv,
+            scale: scale, mask: mask,
+            groupSize: quantizedKVCache.groupSize,
+            bits: quantizedKVCache.bits,
+            mode: quantizedKVCache.mode)
+    }
+    let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+    return MLXFast.scaledDotProductAttention(
+        queries: queries, keys: cachedKeys, values: cachedValues,
+        scale: scale, mask: mask, sinks: sinks)
+}
+
+class SharpAIDeepseekV4Attention: Module {
+    let config: SharpAIDeepseekV4Configuration
+    let numHeads: Int
+    let headDim: Int
+    let nopeHeadDim: Int
+    let ropeHeadDim: Int
+    let oGroups: Int
+    let oLoraRank: Int
+    let nHeadsPerGroup: Int
+    let scale: Float
+    let eps: Float
+
+    let rope: RoPELayer
+
+    // Q low-rank projections
+    @ModuleInfo(key: "wq_a") var wqA: Linear
+    @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
+    @ModuleInfo(key: "wq_b") var wqB: Linear
+
+    // Unified KV projection (K and V share the same projection)
+    @ModuleInfo(key: "wkv") var wkv: Linear
+    @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
+
+    // Grouped output projection
+    @ModuleInfo(key: "wo_a") var woA: Linear
+    @ModuleInfo(key: "wo_b") var woB: Linear
+
+    // KV compressor (SharpAI overlay, layers with compress_ratio > 1)
+    @ModuleInfo(key: "compressor") var compressor: SharpAIOverlay.V4Compressor?
+
+    // Sparse indexer (SharpAI overlay, ratio-4 layers)
+    @ModuleInfo(key: "indexer") var indexer: SharpAIOverlay.V4Indexer?
+
+    // Attention sink bias (per head, no .weight suffix)
+    // Stored via update(parameters:) using the key "attn_sink"
+    var attn_sink: MLXArray
+
+    init(config: SharpAIDeepseekV4Configuration, layerIndex: Int = 0) {
+        self.config = config
+        self.numHeads = config.numAttentionHeads
+        self.headDim = config.headDim
+        self.nopeHeadDim = config.nopeHeadDim
+        self.ropeHeadDim = config.qkRopeHeadDim
+        self.oGroups = config.oGroups
+        self.oLoraRank = config.oLoraRank
+        self.nHeadsPerGroup = config.numAttentionHeads / config.oGroups
+        self.scale = pow(Float(config.headDim), -0.5)
+        self.eps = config.rmsNormEps
+
+        // Q projections
+        self._wqA.wrappedValue = Linear(config.hiddenSize, config.qLoraRank, bias: false)
+        self._qNorm.wrappedValue = RMSNorm(dimensions: config.qLoraRank, eps: config.rmsNormEps)
+        self._wqB.wrappedValue = Linear(config.qLoraRank, config.numAttentionHeads * config.headDim, bias: false)
+
+        // Unified KV: single head, headDim dimensional
+        self._wkv.wrappedValue = Linear(config.hiddenSize, config.headDim, bias: false)
+        self._kvNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
+
+        // Grouped output projection
+        // wo_a: Linear(nHeadsPerGroup * headDim, oGroups * oLoraRank) per group → stored as [oGroups*oLoraRank, nHeadsPerGroup*headDim]
+        self._woA.wrappedValue = Linear(nHeadsPerGroup * config.headDim, config.oGroups * config.oLoraRank, bias: false)
+        self._woB.wrappedValue = Linear(config.oGroups * config.oLoraRank, config.hiddenSize, bias: false)
+
+        // Attention sink: per-head bias [numAttentionHeads], applied to attention logits before softmax.
+        // Shape matches numAttentionHeads (== qkRopeHeadDim in this architecture).
+        self.attn_sink = zeros([config.numAttentionHeads])
+        let ratio = layerIndex < config.compressRatios.count ? config.compressRatios[layerIndex] : 0
+        self._compressor.wrappedValue =
+            ratio > 1
+            ? SharpAIOverlay.V4Compressor(
+                hiddenSize: config.hiddenSize, headDim: config.headDim, ratio: ratio,
+                eps: config.rmsNormEps)
+            : nil
+        self._indexer.wrappedValue =
+            ratio == 4 && config.indexNHeads != nil && config.indexHeadDim != nil && config.indexTopk != nil
+            ? SharpAIOverlay.V4Indexer(
+                hiddenSize: config.hiddenSize, qLoraRank: config.qLoraRank, nHeads: config.indexNHeads!,
+                headDim: config.indexHeadDim!, topk: config.indexTopk!, ropeDim: config.qkRopeHeadDim,
+                eps: config.rmsNormEps)
+            : nil
+
+        // vLLM (commit 2eae56c, cited by the golden suite): layers with compress_ratio <= 1 use rope_theta and plain RoPE;
+        // compressed layers use compress_rope_theta with YaRN and force mscale = 0 so that position 0 stays the identity
+        // (deepseek_scaling_rope.py:52-55,110-111). The YaRN frequencies are checked against vLLM's generic YaRN code
+        // (common.py:32-68, deepseek_scaling_rope.py:73-101 at 739e594) by the `yarn` golden fixtures. Only these two
+        // branches are modelled: vLLM's rope_type selection for the V4 tree (deepseek_llama_scaling when
+        // attention_factor == 1.0, nested per-layer-type rope dicts) is not, and was not verifiable here (the
+        // cited file is not in any reachable tree); config.ropeScaling is used as is.
+        let ropeBase = ratio > 1 ? config.compressRopeTheta : config.ropeTheta
+        var ropeScaling: [String: StringOrNumber]? = ratio > 1 ? config.ropeScaling : nil
+        if ropeScaling != nil {
+            ropeScaling?["mscale"] = .float(0)
+            ropeScaling?["mscale_all_dim"] = .float(0)
+        }
+        self.rope = initializeRope(
+            dims: config.qkRopeHeadDim,
+            base: ropeBase,
+            traditional: true,
+            scalingConfig: ropeScaling,
+            maxPositionEmbeddings: config.maxPositionEmbeddings
+        )
+    }
+
+    /// Grouped output projection matching the reference Python implementation.
+    /// For QuantizedLinear wo_a: slices weight rows per group, calls quantizedMM.
+    /// For plain Linear wo_a: uses batched matmul after weight reshape.
+    /// Input:  [B, L, n_heads, head_dim]
+    /// Output: [B, L, oGroups * oLoraRank]
+    private func groupedOutputProjection(_ out: MLXArray) -> MLXArray {
+        let B = out.dim(0), L = out.dim(1)
+        let groupFeat = numHeads * headDim / oGroups  // = nHeadsPerGroup * headDim
+
+        // Flatten to [B, L, n_heads * head_dim] for easy group slicing
+        let outFlat = out.reshaped(B, L, numHeads * headDim)
+
+        if let qLinear = woA as? QuantizedLinear {
+            var pieces: [MLXArray] = []
+            for g in 0 ..< oGroups {
+                let gStart = g * groupFeat
+                let gEnd   = (g + 1) * groupFeat
+                let rStart = g * oLoraRank
+                let rEnd   = (g + 1) * oLoraRank
+
+                // Per-group input: [B, L, groupFeat]
+                let groupInput = outFlat[0..., 0..., gStart ..< gEnd]
+                // Slice weight rows for this group
+                let wRows = qLinear.weight[rStart ..< rEnd]
+                let sRows = qLinear.scales[rStart ..< rEnd]
+                let bRows = qLinear.biases.map { $0[rStart ..< rEnd] }
+
+                // quantizedMM: [B, L, groupFeat] @ dequant(wRows)^T → [B, L, oLoraRank]
+                let y = quantizedMM(
+                    groupInput,
+                    wRows,
+                    scales: sRows,
+                    biases: bRows,
+                    transpose: true,
+                    groupSize: qLinear.groupSize,
+                    bits: qLinear.bits,
+                    mode: qLinear.mode
+                )
+                pieces.append(y)
+            }
+            return concatenated(pieces, axis: -1)  // [B, L, oGroups * oLoraRank]
+        } else {
+            // Non-quantized fallback: per-group matmul (same structure as quantized path).
+            // A single batched matmul would broadcast batch dims [B,L] against [oGroups],
+            // which fails when L != oGroups, so we loop instead.
+            var pieces: [MLXArray] = []
+            for g in 0 ..< oGroups {
+                let gStart = g * groupFeat
+                let gEnd   = (g + 1) * groupFeat
+                let rStart = g * oLoraRank
+                let rEnd   = (g + 1) * oLoraRank
+                let groupInput = outFlat[0..., 0..., gStart ..< gEnd]  // [B, L, groupFeat]
+                let wa_g = woA.weight[rStart ..< rEnd]                 // [oLoraRank, groupFeat]
+                pieces.append(matmul(groupInput, wa_g.T))              // [B, L, oLoraRank]
+            }
+            return concatenated(pieces, axis: -1)
+        }
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache layerCache: KVCache?
+    ) -> MLXArray {
+        let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
+        // A layer with a compressor owns CacheList(local KV, compressor state); any other cache is used as is.
+        let (cache, v4State) = SharpAIOverlay.v4Split(layerCache)
+
+        // --- Query ---
+        // Low-rank Q: wq_a → q_norm → wq_b
+        let qr = qNorm(wqA(x))                            // q-lora residual (also read by the indexer)
+        var q = wqB(qr)                                   // [B, L, n_heads * head_dim]
+        q = q.reshaped(B, L, numHeads, headDim)
+            .transposed(0, 2, 1, 3)                       // [B, n_heads, L, head_dim]
+        // Per-head RMS normalization (no learnable scale)
+        q = headRmsNorm(q, eps: eps)
+
+        // Split Q into nope and rope parts
+        let qNope = q[.ellipsis, ..<nopeHeadDim]          // [B, n_heads, L, nope_head_dim]
+        var qRope = q[.ellipsis, nopeHeadDim...]           // [B, n_heads, L, rope_head_dim]
+        qRope = applyRotaryPosition(rope, to: qRope, cache: cache)
+        let queries = concatenated([qNope, qRope], axis: -1) // [B, n_heads, L, head_dim]
+
+        // --- KV: k = v (reference: k = v = concat([k_nope, k_pe_roped])) ---
+        let kv = kvNorm(wkv(x))                           // [B, L, head_dim]
+        let kvNope = kv[.ellipsis, ..<nopeHeadDim]
+            .reshaped(B, L, 1, nopeHeadDim)
+            .transposed(0, 2, 1, 3)                       // [B, 1, L, nope_head_dim]
+        var kvRope = kv[.ellipsis, nopeHeadDim...]
+            .reshaped(B, L, 1, ropeHeadDim)
+            .transposed(0, 2, 1, 3)                       // [B, 1, L, rope_head_dim]
+        kvRope = applyRotaryPosition(rope, to: kvRope, cache: cache)
+        let kFull = concatenated([kvNope, kvRope], axis: -1) // [B, 1, L, head_dim]
+        // In reference k = v = kFull: both K and V have rope applied to their rope dims.
+        // attentionWithCacheUpdate handles the KV cache update internally.
+
+        // --- Attention ---
+        // Pass kFull as both keys and values; cache update happens inside.
+        // Apply attn_sink (per-head bias) to attention logits when non-zero.
+        // Cast to queries.dtype (bfloat16) — attn_sink may be loaded as float32 from the
+        // checkpoint, but MLXFast.scaledDotProductAttention requires sinks to promote to
+        // the output dtype (bfloat16); float32 does not satisfy this constraint.
+        let sinksToUse: MLXArray? = attn_sink.sum().item(Float.self) != 0
+            ? attn_sink.asType(queries.dtype)
+            : nil
+        // SharpAI overlay hook (SL-35): compressed entries join the local keys.
+        var attended: MLXArray? = nil
+        if let compressor, cache == nil, L >= compressor.ratio {
+            let compressed = SharpAIOverlay.v4RopeCompressed(
+                compressor(x), rope: rope, ropeDim: ropeHeadDim, ratio: compressor.ratio)
+            let visible = SharpAIOverlay.v4Visibility(
+                length: L, blocks: compressed.dim(1), ratio: compressor.ratio
+            ).expandedDimensions(axis: 0)
+            let readable = indexer.map { visible & $0.select(x, qr: qr, rope: rope) } ?? visible
+            attended = SharpAIOverlay.v4CompressedAttention(
+                queries: queries, localKeys: kFull, compressed: compressed, compressedMask: readable,
+                localMask: mask, scale: scale, sinks: sinksToUse)
+        } else if let compressor, let cache, let v4State, !(cache is QuantizedKVCacheProtocol) {
+            // Cached forward (batch 1): append x to the compressor / indexer state, then attend over the
+            // cached local keys plus every finished entry, as the full-sequence forward does.
+            let start = v4State.comp.count
+            let (localK, _) = cache.update(keys: kFull, values: kFull)
+            let compressed = compressor.append(
+                x, state: &v4State.comp, rope: rope, ropeDim: ropeHeadDim)
+            var indexKeys: MLXArray? = nil
+            if let indexer, v4State.index != nil {
+                indexKeys = indexer.compressor.append(
+                    x, state: &v4State.index!, rope: rope, ropeDim: indexer.ropeDim)
+            }
+            v4State.syncOffset()
+            (layerCache as? CacheList)?.offset = cache.offset
+            if let compressed {
+                var readable = SharpAIOverlay.v4Visibility(
+                    length: L, blocks: compressed.dim(1), ratio: compressor.ratio, start: start
+                ).expandedDimensions(axis: 0)
+                if let indexer, let indexKeys {
+                    readable = readable & indexer.select(x, qr: qr, rope: rope, keys: indexKeys, start: start)
+                }
+                attended = SharpAIOverlay.v4CompressedAttention(
+                    queries: queries, localKeys: localK, compressed: compressed, compressedMask: readable,
+                    localMask: mask, scale: scale, sinks: sinksToUse)
+            }
+            // No finished block yet (or an unsupported mask): local-only attention over the updated cache.
+            attended = attended ?? MLXFast.scaledDotProductAttention(
+                queries: queries, keys: localK, values: localK, scale: scale, mask: mask, sinks: sinksToUse)
+        } else if compressor != nil, let cache {
+            // Not CacheList(local KV, V4CompressorStateCache), or the local KV is quantized: this layer attends
+            // over its local keys only (no compressed entries). Say so once instead of degrading silently.
+            SharpAIOverlay.v4NoteCacheFallback(
+                layerCache: layerCache, local: cache, hasState: v4State != nil)
+        }
+        let output = (attended ?? deepseekAttentionWithSinks(
+            queries: queries,
+            keys: kFull,
+            values: kFull,
+            cache: cache,
+            scale: scale,
+            mask: mask,
+            sinks: sinksToUse
+        ))
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, numHeads, headDim)               // [B, L, n_heads, head_dim]
+
+        // --- Grouped output projection ---
+        let oLora = groupedOutputProjection(output)        // [B, L, oGroups * oLoraRank]
+        return woB(oLora)
+    }
+}
+
+// MARK: - MoE Components
+
+/// Single FFN expert: SwiGLU with optional activation clamping.
+class SharpAIDeepseekV4Expert: Module, UnaryLayer {
+    let swiguLimit: Float
+
+    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ModuleInfo(key: "up_proj") var upProj: Linear
+    @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    init(hiddenSize: Int, intermediateSize: Int, swiguLimit: Float) {
+        self.swiguLimit = swiguLimit
+        self._gateProj.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
+        self._upProj.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
+        self._downProj.wrappedValue = Linear(intermediateSize, hiddenSize, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var gate = gateProj(x)
+        var up = upProj(x)
+        if swiguLimit > 0 {
+            // vLLM SiluAndMulWithClamp (layers/activation.py:239-243): gate max-only, up two-sided.
+            gate = clip(gate, max: swiguLimit)
+            up = clip(up, min: -swiguLimit, max: swiguLimit)
+        }
+        return downProj(silu(gate) * up)
+    }
+}
+
+/// MoE routing gate with sqrtsoftplus. Layers below `num_hash_layers` are hash layers (SL-35 4.3): the experts
+/// come from the `tid2eid[token_id]` lookup table (no score top-k, no e_score_correction_bias); the routing
+/// weights are still the learned scores gathered at those experts.
+class SharpAIDeepseekV4Gate: Module {
+    let topK: Int
+    let nRoutedExperts: Int
+    let routedScalingFactor: Float
+    let normTopkProb: Bool
+    let scoringFunc: String
+    let isHash: Bool
+
+    var weight: MLXArray              // [n_routed_experts, hidden_size]
+    var e_score_correction_bias: MLXArray?  // [n_routed_experts]; nil on hash layers
+    var tid2eid: MLXArray?            // [vocab_size, top_k] int32; hash layers only
+
+    init(config: SharpAIDeepseekV4Configuration, layerIndex: Int = 0) {
+        self.topK = config.numExpertsPerTok
+        self.nRoutedExperts = config.nRoutedExperts
+        self.routedScalingFactor = config.routedScalingFactor
+        self.normTopkProb = config.normTopkProb
+        self.scoringFunc = config.scoringFunc
+        self.isHash = layerIndex < config.numHashLayers
+        self.weight = zeros([config.nRoutedExperts, config.hiddenSize])
+        if isHash {
+            self.e_score_correction_bias = nil
+            self.tid2eid = zeros([config.vocabSize, config.numExpertsPerTok], dtype: .int32)
+        } else {
+            self.e_score_correction_bias = zeros([config.nRoutedExperts])
+            self.tid2eid = nil
+        }
+    }
+
+    /// Learned layers may load without e_score_correction_bias (keep the zero default).
+    override func updateMissing(
+        parameter: String,
+        verify: VerifyUpdate,
+        path: [String],
+        modulePath: [String]
+    ) throws {
+        if parameter == "e_score_correction_bias" {
+            return  // keep zero-initialized default
+        }
+        try super.updateMissing(
+            parameter: parameter, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    /// `tokenIds` ([B, S] ints) is required on hash layers and ignored on learned layers.
+    func callAsFunction(_ x: MLXArray, tokenIds: MLXArray? = nil) -> (MLXArray, MLXArray) {
+        // Compute expert scores
+        // float32 logits and scores for every input dtype (vLLM GateLinear out_dtype=float32, CM:136-142)
+        let logits = x.asType(.float32).matmul(weight.asType(.float32).T)  // [B, S, n_experts]
+        var scores: MLXArray
+        switch scoringFunc {
+        case "softmax":
+            scores = softmax(logits, axis: -1)
+        case "sigmoid":
+            scores = sigmoid(logits)
+        default:
+            // sqrtsoftplus: sqrt(softplus(x)) = sqrt(log(1 + e^x))
+            scores = sqrtSoftplus(logits)
+        }
+
+        let inds: MLXArray
+        if let tid2eid {
+            precondition(tokenIds != nil, "SharpAIDeepseekV4Gate: hash-routing layers need the input token ids")
+            inds = take(tid2eid, tokenIds!, axis: 0)  // [B, S, top_k]
+        } else {
+            // Bias-shifted scores for top-k selection (bias not applied to routing weights)
+            let scoresForChoice = scores + (e_score_correction_bias ?? MLXArray(Float(0)))
+            // Top-k selection
+            inds = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        }
+
+        // Gather weights using original (non-biased) scores
+        var selectedScores = takeAlong(scores, inds, axis: -1)
+
+        // vLLM divides by the sum for every k, k == 1 included (kernels CU:191/469, reference TK:77-78).
+        if normTopkProb {
+            let denominator = selectedScores.sum(axis: -1, keepDims: true) + 1e-20
+            selectedScores = selectedScores / denominator
+        }
+        selectedScores = selectedScores * routedScalingFactor
+
+        // One rounding to the activation dtype, so the expert combine stays in x.dtype.
+        return (inds, selectedScores.asType(x.dtype))
+    }
+}
+
+/// Mixture-of-Experts layer with shared expert.
+class SharpAIDeepseekV4MoE: Module, UnaryLayer {
+    let numExpertsPerTok: Int
+
+    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    var gate: SharpAIDeepseekV4Gate
+    @ModuleInfo(key: "shared_experts") var sharedExperts: SharpAIDeepseekV4Expert
+
+    init(config: SharpAIDeepseekV4Configuration, layerIndex: Int = 0) {
+        self.numExpertsPerTok = config.numExpertsPerTok
+
+        // Routed experts (stacked via SwitchGLU, same as V3)
+        let limit: Float = config.swiguLimit
+        var routedProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)? = nil
+        if limit > 0 {
+            routedProduct = { (gate: MLXArray, up: MLXArray) -> MLXArray in
+                silu(clip(gate, max: limit)) * clip(up, min: -limit, max: limit)
+            }
+        }
+        self._switchMLP.wrappedValue = SwitchGLU(
+            inputDims: config.hiddenSize,
+            hiddenDims: config.moeIntermediateSize,
+            numExperts: config.nRoutedExperts,
+            activation: { x in
+                // SwiGLU with limit: gate clamped max-only (vLLM layers/activation.py:239-243)
+                if config.swiguLimit > 0 {
+                    return silu(clip(x, max: config.swiguLimit))
+                }
+                return silu(x)
+            },
+            // The up half is clamped two-sided as well, so the product is supplied whole.
+            activationProduct: routedProduct
+        )
+        self.gate = SharpAIDeepseekV4Gate(config: config, layerIndex: layerIndex)
+
+        // Shared expert (1 expert, same intermediate size)
+        self._sharedExperts.wrappedValue = SharpAIDeepseekV4Expert(
+            hiddenSize: config.hiddenSize,
+            intermediateSize: config.moeIntermediateSize,
+            swiguLimit: config.swiguLimit
+        )
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        self(x, tokenIds: nil)
+    }
+
+    /// `tokenIds` ([B, S]) feed the hash-routing layers (SL-35 4.3).
+    func callAsFunction(_ x: MLXArray, tokenIds: MLXArray?) -> MLXArray {
+        let (indices, scores) = gate(x, tokenIds: tokenIds)
+        var y = switchMLP(x, indices)
+        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+
+        // Add shared expert output
+        y = y + sharedExperts(x)
+        return y
+    }
+}
+
+// MARK: - Decoder Block (with mHC Hyper-Connections)
+
+public class SharpAIDeepseekV4Block: Module {
+    let config: SharpAIDeepseekV4Configuration
+
+    // Key "attn" matches checkpoint path `layers.{l}.attn.*`
+    @ModuleInfo(key: "attn") var selfAttn: SharpAIDeepseekV4Attention
+    // Plain var: property name "ffn" matches checkpoint path `layers.{l}.ffn.*`
+    var ffn: SharpAIDeepseekV4MoE
+    // Key names match checkpoint: `attn_norm`, `ffn_norm`
+    @ModuleInfo(key: "attn_norm") var attnNorm: RMSNorm
+    @ModuleInfo(key: "ffn_norm") var ffnNorm: RMSNorm
+
+    // Hyper-Connection parameter bundles.
+    // Underscore names match checkpoint paths: `hc_attn.fn/base/scale`, `hc_ffn.fn/base/scale`
+    var hc_attn: SharpAIHCParams
+    var hc_ffn: SharpAIHCParams
+
+    init(config: SharpAIDeepseekV4Configuration, layerIndex: Int = 0) {
+        self.config = config
+
+        self._selfAttn.wrappedValue = SharpAIDeepseekV4Attention(config: config, layerIndex: layerIndex)
+        self.ffn = SharpAIDeepseekV4MoE(config: config, layerIndex: layerIndex)
+
+        self._attnNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self._ffnNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+
+        // Initialize HC parameters (will be overwritten by weight loading)
+        let hc = config.hcMult
+        let mixHc = (2 + hc) * hc
+        let hcDim = hc * config.hiddenSize
+        self.hc_attn = SharpAIHCParams(
+            fn: zeros([mixHc, hcDim]),
+            base: zeros([mixHc]),
+            scale: ones([3]))
+        self.hc_ffn = SharpAIHCParams(
+            fn: zeros([mixHc, hcDim]),
+            base: zeros([mixHc]),
+            scale: ones([3]))
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        tokenIds: MLXArray? = nil
+    ) -> MLXArray {
+        // x: [B, S, hc, D]
+        let residualAttn = x
+
+        // HC pre for attention: [B,S,hc,D] → [B,S,D]
+        let (xAttn, postAttn, combAttn) = sharpAIHCPre(
+            x: residualAttn,
+            hcFn: hc_attn.fn,
+            hcScale: hc_attn.scale,
+            hcBase: hc_attn.base,
+            hcMult: config.hcMult,
+            sinkhornIters: config.hcSinkhornIters,
+            rmsEps: config.rmsNormEps,
+            eps: config.hcEps
+        )
+
+        // Attention sublayer: [B,S,D] → [B,S,D]
+        let attnOut = selfAttn(attnNorm(xAttn), mask: mask, cache: cache)
+
+        // HC post for attention: [B,S,D] → [B,S,hc,D]
+        let residualFfn = sharpAIHCPost(x: attnOut, residual: residualAttn, post: postAttn, comb: combAttn)
+
+        // HC pre for FFN: [B,S,hc,D] → [B,S,D]
+        let (xFfn, postFfn, combFfn) = sharpAIHCPre(
+            x: residualFfn,
+            hcFn: hc_ffn.fn,
+            hcScale: hc_ffn.scale,
+            hcBase: hc_ffn.base,
+            hcMult: config.hcMult,
+            sinkhornIters: config.hcSinkhornIters,
+            rmsEps: config.rmsNormEps,
+            eps: config.hcEps
+        )
+
+        // FFN sublayer: [B,S,D] → [B,S,D]
+        let ffnOut = ffn(ffnNorm(xFfn), tokenIds: tokenIds)
+
+        // HC post for FFN: [B,S,D] → [B,S,hc,D]
+        return sharpAIHCPost(x: ffnOut, residual: residualFfn, post: postFfn, comb: combFfn)
+    }
+}
+
+// MARK: - Inner Model
+
+public class SharpAIDeepseekV4ModelInner: Module, LayerPartitionable, StreamableMoE {
+    var config: SharpAIDeepseekV4Configuration
+
+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    var layers: [SharpAIDeepseekV4Block]
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+
+    // HC head parameter bundle for final reduction [B,S,hc,D] → [B,S,D]
+    // Underscore name matches checkpoint path `model.hc_head.fn/base/scale`
+    var hc_head: SharpAIHCParams
+
+    public var gpuLayerCount: Int? = nil
+    public var streamExperts: Bool = false
+    public var totalLayerCount: Int { layers.count - (MTPConfig.retainMTPWeights ? config.numNextnPredictLayers : 0) }
+
+    init(config: SharpAIDeepseekV4Configuration) {
+        self.config = config
+        self._embedTokens.wrappedValue = Embedding(
+            embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
+        let retainMTP = MTPConfig.retainMTPWeights && config.numNextnPredictLayers > 0
+        // MTP blocks live at index num_hidden_layers.. (outside the main count)
+        let totalCount = config.numHiddenLayers + (retainMTP ? config.numNextnPredictLayers : 0)
+        self.layers = (0 ..< totalCount).map {
+            SharpAIDeepseekV4Block(config: config, layerIndex: $0)
+        }
+        self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+
+        // HC head parameters (will be overwritten by weight loading)
+        let hc = config.hcMult
+        self.hc_head = SharpAIHCParams(
+            fn: zeros([hc, hc * config.hiddenSize]),
+            base: zeros([hc]),
+            scale: ones([1]))
+    }
+
+    func callAsFunction(_ x: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // x: [B, S] token IDs
+        let B = x.dim(0), S = x.dim(1)
+        let hc = config.hcMult
+
+        // Embed tokens: [B, S, D]
+        var h = embedTokens(x)
+
+        // Expand to hc copies: [B, S, hc, D]
+        // Repeat along new hc dimension
+        h = h.expandedDimensions(axis: 2)                  // [B, S, 1, D]
+        h = repeated(h, count: hc, axis: 2)                // [B, S, hc, D]
+
+        // Create causal attention mask; reshape to 3D so dim(1)==S
+        let hForMask = h.reshaped([B, S, hc * config.hiddenSize])  // [B, S, hc*D]
+        let attentionMask = createAttentionMask(
+            h: hForMask, cache: SharpAIOverlay.v4Split(cache?.first).local)
+
+        for (i, layer) in layers.prefix(totalLayerCount).enumerated() {
+            h = partitionedLayerCall(
+                index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts
+            ) {
+                layer(h, mask: attentionMask, cache: cache?[i], tokenIds: x)
+            }
+        }
+
+        // HC head: [B, S, hc, D] → [B, S, D]
+        h = sharpAIHCHead(
+            x: h, hcFn: hc_head.fn, hcScale: hc_head.scale,
+            hcBase: hc_head.base, rmsEps: config.rmsNormEps, eps: config.hcEps)
+
+        return norm(h)
+    }
+}
+
+// MARK: - Top-level Model
+
+public class SharpAIDeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
+    /// One KV head per layer (unified KV, single head)
+    public var kvHeads: [Int]
+
+    var args: SharpAIDeepseekV4Configuration
+    public var model: SharpAIDeepseekV4ModelInner
+    @ModuleInfo(key: "lm_head") var lmHead: Linear
+
+    public init(_ args: SharpAIDeepseekV4Configuration) {
+        SharpAIOverlay.V4CompressorStateCache.register()  // SharpAI overlay (SL-37): restore saved prompt caches
+        self.args = args
+        self.kvHeads = Array(repeating: 1, count: args.numHiddenLayers)
+        self.model = SharpAIDeepseekV4ModelInner(config: args)
+        self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        let out = model(inputs, cache: cache)
+        return lmHead(out)
+    }
+
+    /// One cache per layer. A layer with compress_ratio > 1 gets `CacheList(local KV, compressor state)`
+    /// (SL-35); every other layer keeps the plain attention cache exactly as the protocol default built it.
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try (0 ..< kvHeads.count).map { i in
+            let local = try makeAttentionKVCache(parameters: parameters)
+            let ratio = i < args.compressRatios.count ? args.compressRatios[i] : 0
+            guard ratio > 1 else { return local }
+            return SharpAIOverlay.v4MakeLayerCache(
+                local: local, ratio: ratio, headDim: args.headDim,
+                indexHeadDim: ratio == 4 && args.indexNHeads != nil && args.indexTopk != nil
+                    ? args.indexHeadDim : nil)
+        }
+    }
+
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = checkpoint
+        checkpoint.weights = try sanitize(weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return SharpAIOverlay.applyMXFP4ExpertQuantization(checkpoint, expertDtype: args.expertDtype)  // SharpAI overlay (SL-35)
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = SharpAIOverlay.mapMXFP4Experts(weights, expertDtype: args.expertDtype)  // SharpAI overlay (SL-35)
+        var newWeights = weights
+
+        // 1. Dequantize FP8 weights (weight_scale_inv pattern, same as V3)
+        let fp8 = SharpAIOverlay.FP8BlockConfig(quantizationConfig: args.quantizationConfig)  // SharpAI overlay (SL-35)
+        func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
+            SharpAIOverlay.dequantFP8Blocks(weight: weight, scaleInv: scaleInv, blockSize: fp8.blockSize, ue8m0: fp8.ue8m0)
+        }
+
+        for (key, value) in weights {
+            if key.contains("weight_scale_inv") {
+                let weightKey = key.replacingOccurrences(of: "_scale_inv", with: "")
+                if let weight = weights[weightKey] {
+                    newWeights[weightKey] = dequant(weight: weight, scaleInv: value)
+                }
+            } else if newWeights[key] == nil {
+                newWeights[key] = value
+            }
+        }
+
+        // 2. Stack per-expert weights into SwitchGLU format (for non-pre-stacked checkpoints)
+        // MLX quantized checkpoints already have stacked weights; this is a no-op for them.
+        let mainLayerCount = args.numHiddenLayers
+        for l in 0 ..< mainLayerCount {
+            let prefix = "model.layers.\(l)"
+            for projName in ["gate_proj", "down_proj", "up_proj"] {
+                for key in ["weight", "scales", "biases"] {
+                    let firstKey = "\(prefix).ffn.experts.0.\(projName).\(key)"
+                    if weights[firstKey] != nil {
+                        let stacked = (0 ..< args.nRoutedExperts).map {
+                            // Prefer dequantized value from newWeights (FP8 dequant), fall back to original
+                            newWeights["\(prefix).ffn.experts.\($0).\(projName).\(key)"]
+                                ?? weights["\(prefix).ffn.experts.\($0).\(projName).\(key)"]!
+                        }
+                        newWeights["\(prefix).ffn.switch_mlp.\(projName).\(key)"] = MLX.stacked(stacked)
+                        for j in 0 ..< args.nRoutedExperts {
+                            newWeights.removeValue(forKey: "\(prefix).ffn.experts.\(j).\(projName).\(key)")
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Filter out MTP (multi-token prediction) layers and rotary_emb keys
+        // Also drop compressor/indexer sub-module keys (not yet implemented)
+        let numMainLayers = args.numHiddenLayers
+        var finalWeights = [String: MLXArray]()
+        for (key, value) in newWeights {
+            // Drop rotary embedding precomputed frequencies
+            if key.contains("rotary_emb.inv_freq") { continue }
+            // compressor (SL-35 4.1), indexer (SL-35 4.2) and gate.tid2eid (4.3) tensors are kept.
+            // Hash layers have no score-correction bias; drop one if a converter emitted it.
+            if key.hasSuffix(".ffn.gate.e_score_correction_bias"),
+                let layerIdx = key.split(separator: ".").dropFirst(2).first.flatMap({ Int($0) }),
+                layerIdx < args.numHashLayers
+            {
+                continue
+            }
+
+            if key.starts(with: "model.layers.") {
+                let parts = key.split(separator: ".")
+                if parts.count >= 3, let layerIdx = Int(parts[2]) {
+                    if layerIdx >= numMainLayers && !MTPConfig.retainMTPWeights {
+                        continue
+                    }
+                }
+            }
+            finalWeights[key] = value
+        }
+        return finalWeights
+    }
+
+    public var loraLayers: [Module] {
+        model.layers
+    }
+}
+
+// MARK: - MTPLanguageModel Conformance for SharpAIDeepseekV4Model
+
+/// DeepSeek V4 uses a different MTP scheme: the MTP layers are the last
+/// `numNextnPredictLayers` standard transformer blocks (`model.layers[numMainLayers...]`).
+/// They share the same architecture as the main blocks but operate on the final hidden state.
+/// The main `lm_head` is reused for all MTP depth projections.
+extension SharpAIDeepseekV4Model: MTPLanguageModel {
+    public func callMTP(_ inputs: MLXArray, cache: [KVCache]?, mtpCaches: [[KVCache]]?) -> [MLXArray] {
+        let mtpLayers = model.layers.suffix(args.numNextnPredictLayers)
+        guard MTPConfig.retainMTPWeights, !mtpLayers.isEmpty else {
+            return [callAsFunction(inputs, cache: cache)]
+        }
+
+        // Run the main model body (excludes MTP layers \u2014 SharpAIDeepseekV4ModelInner only
+        // instantiates `numMain` blocks, so this is the standard forward pass)
+        let mainHidden = model(inputs, cache: cache)
+        let mainLogits = lmHead(mainHidden)
+        var result = [mainLogits]
+
+        // Chain MTP blocks stored in `model.mtpLayers`
+        var prevHidden = mainHidden
+        let B = prevHidden.dim(0), S = prevHidden.dim(1)
+        let hc = args.hcMult
+        for (i, mtpLayer) in mtpLayers.enumerated() {
+            let mtpCache = mtpCaches?[i]
+            // Expand [B, S, D] -> [B, S, hc, D]
+            var h = prevHidden.expandedDimensions(axis: 2)
+            h = repeated(h, count: hc, axis: 2)
+
+            let hForMask = h.reshaped([B, S, hc * args.hiddenSize])
+            let attentionMask = createAttentionMask(h: hForMask, cache: mtpCache?.first)
+            
+            h = mtpLayer(h, mask: attentionMask, cache: mtpCache?.first)
+            
+            // Reduce back to [B, S, D]
+            prevHidden = sharpAIHCHead(
+                x: h, hcFn: model.hc_head.fn, hcScale: model.hc_head.scale,
+                hcBase: model.hc_head.base, rmsEps: args.rmsNormEps, eps: args.hcEps)
+                
+            let mtpLogits = lmHead(model.norm(prevHidden))
+            result.append(mtpLogits)
+        }
+
+        return result
+    }
+
+    public func makeMTPCaches(parameters: GenerateParameters?) -> [[KVCache]] {
+        return (0 ..< args.numNextnPredictLayers).map { _ in
+            [KVCacheSimple()]
+        }
+    }
+}
