@@ -42,12 +42,19 @@ public final class SharpAIDeepseekV32Inner: Module, LayerPartitionable, Streamab
     /// Runs the main stack only. MTP blocks sit past `numMainLayers` and are not run here.
     func callAsFunction(_ x: MLXArray, cache: [CacheList]?) -> MLXArray {
         var h = embedTokens(x)
-        let attentionMask = createAttentionMask(h: h, cache: cache?.first?[0])
+        // Same masking as DeepseekV32ModelInner: one boolean causal mask, each layer ANDs in
+        // its own top-k, and shared-index layers reuse the previous layer's selection.
+        let L = h.dim(1)
+        let offset = cache?.first?[0].offset ?? 0
+        let attentionMask: MLXArray? = L > 1 ? createCausalMask(n: L, offset: offset) : nil
 
+        var prevTopkIndices: MLXArray? = nil
         for i in 0 ..< numMainLayers {
             let layer = layers[i]
-            h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts) {
-                layer(h, mask: attentionMask, cache: cache?[i])
+            (h, prevTopkIndices) = partitionedLayerCall(
+                index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts
+            ) {
+                layer(h, mask: attentionMask, cache: cache?[i], prevTopkIndices: prevTopkIndices)
             }
         }
 

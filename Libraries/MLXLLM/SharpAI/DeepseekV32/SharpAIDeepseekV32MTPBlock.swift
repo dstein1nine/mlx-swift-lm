@@ -36,7 +36,9 @@ final class SharpAIDeepseekV32MTPBlock: DeepseekV32DecoderLayer {
     /// `tokenEmbeddings` and `hidden` are both [B, S, D]. Returns the pre-norm hidden state.
     func predict(tokenEmbeddings: MLXArray, hidden: MLXArray, cache: CacheList?) -> MLXArray {
         let fused = ehProj(concatenated([enorm(tokenEmbeddings), hnorm(hidden)], axis: -1))
-        let mask = createAttentionMask(h: fused, cache: cache?[0])
-        return callAsFunction(fused, mask: mask, cache: cache)
+        let L = fused.dim(1)
+        let mask: MLXArray? =
+            L > 1 ? createCausalMask(n: L, offset: cache?[0].offset ?? 0) : nil
+        return callAsFunction(fused, mask: mask, cache: cache, prevTopkIndices: nil).0
     }
 }
