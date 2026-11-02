@@ -1063,6 +1063,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
                 // Concurrent pread (same as fast path)
                 let totalReads = ranges.count * 3
                 let errState = ThreadSafeError()
+                let readStart = DispatchTime.now().uptimeNanoseconds
                 DispatchQueue.concurrentPerform(iterations: totalReads) { [ranges] i in
                     errState.catchError {
                     let expertIdx = i / 3
@@ -1085,6 +1086,9 @@ open class SwitchGLU: Module, @unchecked Sendable {
                     }
                 }
                 errState.check()
+                StreamEngine.shared.recordPromptRead(
+                    bytes: (gateBuffers + upBuffers + downBuffers).reduce(0) { $0 + $1.nbytes },
+                    nanos: DispatchTime.now().uptimeNanoseconds - readStart)
 
                 // Lazy compute (no eval — next layer forces it)
                 let xGate = gateProj.computeExperts(x, buffers: gateBuffers, ranges: ranges)

@@ -29,6 +29,9 @@ public final class StreamEngine: @unchecked Sendable {
         public var bytesRead: UInt64 = 0
         public var readNanos: UInt64 = 0
         public var readBatches = 0
+        /// Expert bytes the prompt (prefill) path reads, which bypasses `read(_:units:kind:)`.
+        public var promptBytesRead: UInt64 = 0
+        public var promptReadNanos: UInt64 = 0
     }
 
     /// Concurrent preads per batch. 0 means one per job.
@@ -79,6 +82,13 @@ public final class StreamEngine: @unchecked Sendable {
     }
 
     public func snapshot() -> Metrics { lock.withLock { metrics } }
+
+    public func recordPromptRead(bytes: Int, nanos: UInt64) {
+        lock.withLock {
+            metrics.promptBytesRead += UInt64(bytes)
+            metrics.promptReadNanos += nanos
+        }
+    }
 
     public func recordResolution(hits: Int, misses: Int) {
         lock.withLock {
