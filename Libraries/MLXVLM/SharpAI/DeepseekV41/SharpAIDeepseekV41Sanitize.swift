@@ -22,7 +22,8 @@ public enum SharpAIDeepseekV41Sanitizer {
                 && !$0.key.hasPrefix("vision.")
                 && !$0.key.hasPrefix("aligner.")
                 && !$0.key.hasPrefix("image_")
-                && !$0.key.contains(".engram.")
+                // The Engram tables are read from disk per token (DeepseekV41EngramTable).
+                && !$0.key.contains(".engram.embed.")
         }
     }
 
@@ -116,6 +117,10 @@ public enum SharpAIDeepseekV41Sanitizer {
             (".shared_experts.w2.", ".shared_experts.down_proj."),
             (".shared_experts.w3.", ".shared_experts.up_proj."),
         ]
+        // Engram keys (wkv, q_weight, k_weight) already match the module names.
+        if key.contains(".engram.") {
+            return "model." + key
+        }
         var name = "model." + key
         for (from, to) in pairs {
             name = name.replacingOccurrences(of: from, with: to)

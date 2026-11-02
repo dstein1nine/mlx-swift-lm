@@ -51,8 +51,8 @@ final class SharpAIDeepseekV41RegistrationTests: XCTestCase {
         }
     }
 
-    /// Engram layers are rejected, as mlx-lm's ModelArgs.__post_init__ does.
-    func testEngramLayersAreRejected() throws {
+    /// Engram layers without the rest of their engram_* config are rejected.
+    func testIncompleteEngramConfigIsRejected() throws {
         guard let creator = SharpAIDeepseekV41Overlay.creators["deepseek_v41"] else {
             XCTFail("deepseek_v41 creator missing")
             return
@@ -65,11 +65,10 @@ final class SharpAIDeepseekV41RegistrationTests: XCTestCase {
             """
 
         XCTAssertThrowsError(try creator(Data(json.utf8))) { error in
-            guard case SharpAIDeepseekV41Error.engramNotSupported(let layers) = error else {
+            guard case DeepseekV41EngramError.missingConfiguration = error else {
                 XCTFail("unexpected error: \(error)")
                 return
             }
-            XCTAssertEqual(layers, [1, 14])
         }
     }
 

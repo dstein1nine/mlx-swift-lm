@@ -13,7 +13,6 @@ import MLXLMCommon
 public enum SharpAIDeepseekV41Error: LocalizedError {
     case forwardNotImplemented(String)
     case missingTextConfig
-    case engramNotSupported([Int])
 
     public var errorDescription: String? {
         switch self {
@@ -21,10 +20,6 @@ public enum SharpAIDeepseekV41Error: LocalizedError {
             return "Model type \(type) is registered, but its model class is not implemented."
         case .missingTextConfig:
             return "deepseek_v41 config has no text_config section, so no text model can be built."
-        case .engramNotSupported(let layers):
-            return
-                "Layers \(layers) use Engram memory, which this implementation does not have: "
-                + "the n-gram hash tables, the hashed embedding lookup and the engram attention are missing."
         }
     }
 }
@@ -99,6 +94,10 @@ public struct SharpAIDeepseekV41TextConfiguration: Decodable, Sendable {
     public let engramVocabSize: Int?
     public let engramNHeads: Int?
     public let engramHeadDim: Int?
+    public let engramNumEmbeddings: [Int]
+    /// `engram_pad_token_id` in MLX conversions, `engram_pad_id` in the reference config.
+    public let engramPadTokenId: Int?
+    public let engramCompressedVocabSize: Int?
     public let numNextnPredictLayers: Int?
     public let dsparkBlockSize: Int?
     public let dsparkTargetLayerIds: [Int]
@@ -148,6 +147,10 @@ public struct SharpAIDeepseekV41TextConfiguration: Decodable, Sendable {
         case engramVocabSize = "engram_vocab_size"
         case engramNHeads = "engram_n_heads"
         case engramHeadDim = "engram_head_dim"
+        case engramNumEmbeddings = "engram_num_embeddings"
+        case engramPadTokenId = "engram_pad_token_id"
+        case engramPadId = "engram_pad_id"
+        case engramCompressedVocabSize = "engram_compressed_vocab_size"
         case numNextnPredictLayers = "num_nextn_predict_layers"
         case dsparkBlockSize = "dspark_block_size"
         case dsparkTargetLayerIds = "dspark_target_layer_ids"
@@ -157,6 +160,27 @@ public struct SharpAIDeepseekV41TextConfiguration: Decodable, Sendable {
     }
 
     /// Rejects values that would otherwise trap during model construction or the first forward.
+    /// Engram layers need every engram_* field; the tables themselves are checked on attach.
+    public func validateEngram() throws {
+        guard !engramLayerIds.isEmpty else { return }
+        let required: [(String, Bool)] = [
+            ("engram_max_ngram_size", (engramMaxNgramSize ?? 0) >= 2),
+            ("engram_vocab_size", (engramVocabSize ?? 0) > 0),
+            ("engram_n_heads", (engramNHeads ?? 0) > 0),
+            ("engram_head_dim", (engramHeadDim ?? 0) > 0),
+            ("engram_pad_token_id", engramPadTokenId != nil),
+            ("engram_compressed_vocab_size", (engramCompressedVocabSize ?? 0) > 0),
+            ("engram_num_embeddings", engramNumEmbeddings.count == engramLayerIds.count),
+        ]
+        if let missing = required.first(where: { !$0.1 }) {
+            throw DeepseekV41EngramError.missingConfiguration(missing.0)
+        }
+        for id in engramLayerIds where id < 0 || id >= numHiddenLayers {
+            throw DeepseekV41EngramError.missingConfiguration(
+                "engram layer \(id) inside 0..<\(numHiddenLayers)")
+        }
+    }
+
     public func validate() throws {
         func fail(_ message: String) -> ModelFactoryError {
             .invalidConfiguration("deepseek_v41: \(message)")
@@ -244,6 +268,13 @@ public struct SharpAIDeepseekV41TextConfiguration: Decodable, Sendable {
         engramVocabSize = try c.decodeIfPresent(Int.self, forKey: .engramVocabSize)
         engramNHeads = try c.decodeIfPresent(Int.self, forKey: .engramNHeads)
         engramHeadDim = try c.decodeIfPresent(Int.self, forKey: .engramHeadDim)
+        engramNumEmbeddings =
+            try c.decodeIfPresent([Int].self, forKey: .engramNumEmbeddings) ?? []
+        engramPadTokenId =
+            try c.decodeIfPresent(Int.self, forKey: .engramPadTokenId)
+            ?? c.decodeIfPresent(Int.self, forKey: .engramPadId)
+        engramCompressedVocabSize =
+            try c.decodeIfPresent(Int.self, forKey: .engramCompressedVocabSize)
         numNextnPredictLayers = try c.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers)
         dsparkBlockSize = try c.decodeIfPresent(Int.self, forKey: .dsparkBlockSize)
         dsparkTargetLayerIds =

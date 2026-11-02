@@ -647,6 +647,12 @@ public func loadWeights(
         }
     }
 
+    // Models that read some tensors straight from the weight files at run time (DeepSeek
+    // V4.1's Engram hash tables) learn where those files are.
+    if let attaching = model as? any ModelDirectoryAttaching {
+        try attaching.attach(modelDirectory: modelDirectory)
+    }
+
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
     if !lazyLoad {
@@ -654,6 +660,13 @@ public func loadWeights(
     } else if streamsThisModel {
         materializeNonExpertWeights(model)
     }
+}
+
+/// A model that reads some of its tensors from the weight files during inference instead of
+/// loading them (tables too large to keep in memory, of which each step needs a few rows).
+/// `loadWeights` calls `attach` after applying the weights it does load.
+public protocol ModelDirectoryAttaching {
+    func attach(modelDirectory: URL) throws
 }
 
 /// Read every non-expert weight of an SSD-streaming model into memory before serving.

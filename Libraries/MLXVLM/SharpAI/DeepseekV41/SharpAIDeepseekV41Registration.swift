@@ -1,11 +1,11 @@
 // SharpAI fork overlay: deepseek_v41 creator. Not part of upstream mlx-swift-lm.
 //
 // The creator decodes and validates the config, then builds the text model. It rejects a config
-// without text_config, and Engram layers (mlx-lm's ModelArgs.__post_init__ rejects them too).
+// without text fields, and Engram layers whose config is incomplete.
 // Wiring into VLMTypeRegistry is left to the overlay consumer; VLMModelFactory is not edited.
 //
 // Known gaps (not implemented): fp8/fp4 activation fake-quant, pipeline and tensor sharding,
-// Engram, the DSpark drafter (DSparkV41DraftModel shares this model_type), the MTP head, the
+// the DSpark drafter (DSparkV41DraftModel shares this model_type), the MTP head, the
 // vision tower, and the fp8/fp4 checkpoint scale repack (see SharpAIDeepseekV41Sanitizer).
 
 import Foundation
@@ -22,9 +22,7 @@ public enum SharpAIDeepseekV41Overlay {
             guard let text = configuration.text else {
                 throw SharpAIDeepseekV41Error.missingTextConfig
             }
-            guard text.engramLayerIds.isEmpty else {
-                throw SharpAIDeepseekV41Error.engramNotSupported(text.engramLayerIds)
-            }
+            try text.validateEngram()
             return SharpAIDeepseekV41Model(text)
         }
     ]

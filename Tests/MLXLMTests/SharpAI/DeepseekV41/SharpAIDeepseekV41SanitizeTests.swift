@@ -45,23 +45,31 @@ final class SharpAIDeepseekV41SanitizeTests: XCTestCase {
         XCTAssertTrue(SharpAIDeepseekV41Sanitizer.sanitize([:]).isEmpty)
     }
 
-    /// Engram tables and DSpark drafter weights are not loaded by the text model.
-    /// Engram keys are dropped by the `.engram.` filter in mlx-lm; DSpark keys by `mtp.`.
-    func testEngramAndDSparkKeysDropped() {
+    /// The Engram tables are read from disk, and DSpark drafter weights are not loaded; the
+    /// Engram projection and gate weights load under their own names.
+    func testEngramTablesAndDSparkKeysDropped() {
         let dropped = [
-            "model.layers.1.engram.embed.weight",
-            "model.layers.14.engram.gate.weight",
+            "layers.1.engram.embed.weight",
+            "layers.14.engram.embed.scales",
             "mtp.0.dspark.block.weight",
         ]
-        let kept = "model.layers.1.ffn.gate.weight"
-        var weights: [String: MLXArray] = [kept: vector(4)]
+        var weights: [String: MLXArray] = [
+            "layers.1.ffn.gate.weight": vector(4),
+            "layers.1.engram.wkv.weight": vector(6),
+            "layers.1.engram.q_weight": vector(7),
+        ]
         for name in dropped {
             weights[name] = vector(5)
         }
 
-        let result = SharpAIDeepseekV41Sanitizer.sanitize(weights)
+        let result = SharpAIDeepseekV41Sanitizer.toModuleKeys(weights, numExperts: 2)
 
-        XCTAssertEqual(Set(result.keys), [kept])
+        XCTAssertEqual(
+            Set(result.keys),
+            [
+                "model.layers.1.mlp.gate.weight", "model.layers.1.engram.wkv.weight",
+                "model.layers.1.engram.q_weight",
+            ])
     }
 
     /// An MLX-quantized checkpoint stores each expert's `scales` and `biases` next to its packed

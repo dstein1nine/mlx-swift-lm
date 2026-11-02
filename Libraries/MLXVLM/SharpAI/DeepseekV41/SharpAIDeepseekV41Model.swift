@@ -203,6 +203,8 @@ public final class DeepseekV41LayerCache: BaseKVCache {
     var indexK: MLXArray?
     var pendingKV: MLXArray?
     var pendingGate: MLXArray?
+    /// Compressed ids of the last tokens per batch row, for the next Engram n-grams.
+    var engramHistory: [[Int64]] = []
 
     public init(windowSize: Int) {
         self.windowSize = windowSize
@@ -727,8 +729,18 @@ public final class DeepseekV41DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayernorm: RMSNorm
     @ModuleInfo(key: "attn_hc") var attnHC: DeepseekV41HyperConnection
     @ModuleInfo(key: "ffn_hc") var ffnHC: DeepseekV41HyperConnection
+    @ModuleInfo(key: "engram") var engram: DeepseekV41Engram?
+    let layerId: Int
 
     init(_ args: SharpAIDeepseekV41TextConfiguration, layerId: Int) {
+        self.layerId = layerId
+        if args.engramLayerIds.contains(layerId), let ngram = args.engramMaxNgramSize,
+            let heads = args.engramNHeads, let headDim = args.engramHeadDim
+        {
+            self._engram.wrappedValue = DeepseekV41Engram(
+                dim: args.hiddenSize, hcMult: args.hcMult,
+                inputDims: (ngram - 1) * heads * headDim, eps: args.rmsNormEps)
+        }
         self._selfAttn.wrappedValue = DeepseekV41Attention(args, layerId: layerId)
         self._mlp.wrappedValue = DeepseekV41MoE(args)
         self._inputLayernorm.wrappedValue = RMSNorm(
@@ -763,6 +775,8 @@ public final class DeepseekV41TextModel: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     var layers: [DeepseekV41DecoderLayer]
     @ModuleInfo(key: "norm") var norm: RMSNorm
+    /// Set by `SharpAIDeepseekV41Model.attach(modelDirectory:)` when the config has Engram layers.
+    var engramRuntime: DeepseekV41EngramRuntime?
 
     init(_ args: SharpAIDeepseekV41TextConfiguration) {
         self.args = args
@@ -776,6 +790,7 @@ public final class DeepseekV41TextModel: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [DeepseekV41LayerCache]) -> MLXArray {
+        let engramRows = args.engramLayerIds.isEmpty ? [:] : engramInputs(inputs, cache: cache[0])
         let h = embedTokens(inputs)
         let batch = h.dim(0)
         let length = h.dim(1)
@@ -794,11 +809,62 @@ public final class DeepseekV41TextModel: Module {
             ], axis: -1)
         var shared: [String: MLXArray] = [:]
         for (layer, layerCache) in zip(layers, cache) {
+            if let engram = layer.engram, let rows = engramRows[layer.layerId] {
+                streams = engram(streams, embedded: rows)
+            }
             (streams, preMix) = layer(
                 streams, preMix: preMix, startPos: startPos, windowIdx: windowIdx,
                 cache: layerCache, shared: &shared)
         }
         return norm(deepseekV41Collapse(streams, preMix))
+    }
+}
+
+extension DeepseekV41TextModel {
+    /// The fetched Engram rows per layer id, [B, L, columns * headDim], for `inputs` [B, L].
+    /// Advances the n-gram history held in `cache`.
+    func engramInputs(_ inputs: MLXArray, cache: DeepseekV41LayerCache) -> [Int: MLXArray] {
+        guard let runtime = engramRuntime else {
+            fatalError(
+                "deepseek_v41: Engram layers \(args.engramLayerIds) have no tables; load the "
+                    + "model with loadWeights so attach(modelDirectory:) runs")
+        }
+        let hasher = runtime.hasher
+        let (batch, length) = (inputs.dim(0), inputs.dim(1))
+        let tokens = inputs.asType(.int32).asArray(Int32.self)
+        if cache.engramHistory.count != batch {
+            cache.engramHistory = Array(repeating: [], count: batch)
+        }
+        let layerCount = hasher.layerIds.count
+        let columns = hasher.columns
+        var ids = [[Int32]](repeating: [], count: layerCount)
+        for row in 0 ..< batch {
+            let compressed = tokens[(row * length) ..< ((row + 1) * length)].map {
+                hasher.compress(Int($0))
+            }
+            let rowIds = hasher.rowIds(compressed: compressed, history: cache.engramHistory[row])
+            cache.engramHistory[row] = Array(
+                (cache.engramHistory[row] + compressed).suffix(hasher.maxNgramSize - 1))
+            for position in 0 ..< length {
+                for layer in 0 ..< layerCount {
+                    let start = (position * layerCount + layer) * columns
+                    ids[layer].append(contentsOf: rowIds[start ..< (start + columns)])
+                }
+            }
+        }
+        var out: [Int: MLXArray] = [:]
+        for (layer, layerId) in hasher.layerIds.enumerated() {
+            guard let table = runtime.tables[layerId] else {
+                fatalError("deepseek_v41: no Engram table for layer \(layerId)")
+            }
+            do {
+                out[layerId] = try table.rows(ids[layer])
+                    .reshaped(batch, length, columns * table.headDim)
+            } catch {
+                fatalError("deepseek_v41: \(error.localizedDescription)")
+            }
+        }
+        return out
     }
 }
 
@@ -855,5 +921,68 @@ public final class SharpAIDeepseekV41Model: Module, LLMModel, LoRAModel {
                     + "newCache(parameters:)); got \(type(of: cache))")
         }
         return typed
+    }
+}
+
+extension SharpAIDeepseekV41Model: ModelDirectoryAttaching {
+    /// Opens the Engram tables in the weight files and builds the n-gram hasher.
+    public func attach(modelDirectory: URL) throws {
+        guard !args.engramLayerIds.isEmpty else { return }
+        try args.validateEngram()
+        let hasher = try DeepseekV41EngramHasher(
+            layerIds: args.engramLayerIds, maxNgramSize: args.engramMaxNgramSize ?? 0,
+            nHeads: args.engramNHeads ?? 0, vocabSize: args.engramVocabSize ?? 0,
+            compressedVocabSize: args.engramCompressedVocabSize ?? 0,
+            numEmbeddings: args.engramNumEmbeddings,
+            tokenMap: try DeepseekV41EngramRuntime.loadTokenMap(modelDirectory: modelDirectory),
+            padTokenId: args.engramPadTokenId ?? 0)
+        var tables: [Int: DeepseekV41EngramTable] = [:]
+        for (i, layerId) in args.engramLayerIds.enumerated() {
+            let table = try DeepseekV41EngramTable(
+                modelDirectory: modelDirectory, layerId: layerId, headDim: args.engramHeadDim ?? 0)
+            guard table.rowCount == args.engramNumEmbeddings[i] else {
+                throw DeepseekV41EngramError.tableSizeMismatch(
+                    layerId: layerId, expected: args.engramNumEmbeddings[i],
+                    fromPrimes: table.rowCount)
+            }
+            tables[layerId] = table
+        }
+        model.engramRuntime = DeepseekV41EngramRuntime(hasher: hasher, tables: tables)
+    }
+}
+
+extension SharpAIDeepseekV41Model {
+    /// MLX conversions mix bit widths (4-bit experts, 8-bit attention, shared experts and Engram
+    /// wkv) but their config states one. Infer each layer's bits from its packed width.
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = checkpoint
+        checkpoint.weights = sanitize(weights: checkpoint.weights)
+        guard let quantization = checkpoint.perLayerQuantization,
+            let base = quantization.quantization
+        else { return checkpoint }
+        checkpoint.perLayerQuantization = .init(
+            quantization: base,
+            perLayerQuantization: Self.inferredBits(
+                checkpoint.weights, base: base, overrides: quantization.perLayerQuantization))
+        return checkpoint
+    }
+
+    public static func inferredBits(
+        _ weights: [String: MLXArray], base: BaseConfiguration.Quantization,
+        overrides: [String: BaseConfiguration.QuantizationOption]
+    ) -> [String: BaseConfiguration.QuantizationOption] {
+        var result = overrides
+        for (key, scales) in weights where key.hasSuffix(".scales") {
+            let path = String(key.dropLast(".scales".count))
+            guard result[path] == nil, let weight = weights[path + ".weight"] else { continue }
+            let inputDims = scales.dim(-1) * base.groupSize
+            let packedBits = weight.dim(-1) * 32
+            guard inputDims > 0, packedBits % inputDims == 0 else { continue }
+            let bits = packedBits / inputDims
+            if bits != base.bits {
+                result[path] = .quantize(.init(groupSize: base.groupSize, bits: bits))
+            }
+        }
+        return result
     }
 }
