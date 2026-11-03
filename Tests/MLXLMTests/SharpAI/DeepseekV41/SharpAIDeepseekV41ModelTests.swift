@@ -68,6 +68,17 @@ final class SharpAIDeepseekV41ModelTests: XCTestCase {
         return SharpAIDeepseekV41Model(text)
     }
 
+    /// Some weights start at zero (o_a_proj), which hides the attention cache from the output.
+    private func makeRandomModel() throws -> SharpAIDeepseekV41Model {
+        let model = try makeModel()
+        MLXRandom.seed(41)
+        let random = model.parameters().flattened().map { key, value in
+            (key, MLXRandom.normal(value.shape, scale: 0.2).asType(value.dtype))
+        }
+        try model.update(parameters: ModuleParameters.unflattened(random), verify: .all)
+        return model
+    }
+
     func testForwardPassReturnsVocabularyLogits() throws {
         let model = try makeModel()
         let tokens = MLXArray([Int32(3), 7, 1, 9, 4]).reshaped(1, 5)
@@ -80,7 +91,7 @@ final class SharpAIDeepseekV41ModelTests: XCTestCase {
     /// Window rows, closed compressed groups, index keys and the open group must all carry over
     /// between calls: an incremental decode has to match one prefill over the same tokens.
     func testIncrementalDecodeMatchesPrefill() throws {
-        let model = try makeModel()
+        let model = try makeRandomModel()
         let tokens = MLXArray([Int32(3), 7, 1, 9, 4, 2, 8]).reshaped(1, 7)
 
         let prefill = model(tokens, cache: model.newCache(parameters: nil))
@@ -94,6 +105,33 @@ final class SharpAIDeepseekV41ModelTests: XCTestCase {
 
         XCTAssertEqual(incremental.shape, prefill.shape)
         XCTAssertTrue(allClose(prefill, incremental, rtol: 1e-3, atol: 1e-3).item(Bool.self))
+    }
+
+    /// A prompt cache restores state and metaState into fresh caches and keeps decoding. Eleven
+    /// tokens wrap the 4-row window and leave a ratio-2 group open.
+    func testRestoredCacheSnapshotDecodesLikeTheLiveCache() throws {
+        let model = try makeRandomModel()
+        let tokens = MLXArray((0 ..< 16).map { Int32(($0 * 5 + 1) % 64) }).reshaped(1, 16)
+        let live = model.newCache(parameters: nil)
+        eval(model(tokens[0..., ..<11], cache: live))
+
+        let restored = model.newCache(parameters: nil)
+        for (source, target) in zip(live, restored) {
+            XCTAssertTrue(target is PrefixSnapshotKVCache)
+            var target = target
+            target.state = source.state
+            target.metaState = source.metaState
+            XCTAssertEqual(target.metaState, source.metaState)
+            XCTAssertEqual(target.offset, 11)
+        }
+
+        for t in 11 ..< 16 {
+            let step = tokens[0..., t ..< (t + 1)]
+            let expected = model(step, cache: live)
+            let got = model(step, cache: restored)
+            XCTAssertGreaterThan(abs(expected).max().item(Float.self), 0)
+            XCTAssertEqual(abs(expected - got).max().item(Float.self), 0)
+        }
     }
 
     func testCheckpointNamesMapToModuleNames() {

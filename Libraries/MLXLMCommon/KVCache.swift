@@ -230,6 +230,10 @@ public protocol QuantizedKVCacheProtocol: KVCache {
     func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
 }
 
+/// A cache that cannot be trimmed but whose `state` and `metaState` restore it exactly. A server
+/// can reuse it only for an exact prompt prefix, snapshotted before generation advances it.
+public protocol PrefixSnapshotKVCache: KVCache {}
+
 /// Protocol for caches that can update and compute attention from their own storage layout.
 ///
 /// Used by compressed caches such as ``VarianceNormalizedKVCache`` that keep completed

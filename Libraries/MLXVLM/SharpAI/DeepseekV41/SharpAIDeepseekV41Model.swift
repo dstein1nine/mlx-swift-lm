@@ -194,9 +194,10 @@ private func deepseekV41Append(_ cached: MLXArray?, _ new: MLXArray) -> MLXArray
 // MARK: - Cache
 
 /// Cache for one decoder layer: the sliding window, the closed compressed groups and their index
-/// keys, and the rows of the group that is still open. Its state is not trimmable and not
-/// serialized (the reference has the same limits).
-public final class DeepseekV41LayerCache: BaseKVCache {
+/// keys, and the rows of the group that is still open. Its state is not trimmable (the reference
+/// has the same limit), but `state` and `metaState` restore it exactly, so a server can reuse it
+/// for an exact prompt prefix.
+public final class DeepseekV41LayerCache: BaseKVCache, PrefixSnapshotKVCache {
     let windowSize: Int
     var window: MLXArray?
     var compressKV: MLXArray?
@@ -222,6 +223,36 @@ public final class DeepseekV41LayerCache: BaseKVCache {
 
     public override func innerState() -> [MLXArray] {
         [window, compressKV, indexK, pendingKV, pendingGate].compactMap { $0 }
+    }
+
+    /// Always five arrays, in field order; an unset field is a 1-D empty placeholder (the real
+    /// arrays are [B, T, D], so an empty one stays distinct from an unset one).
+    public override var state: [MLXArray] {
+        get {
+            [window, compressKV, indexK, pendingKV, pendingGate].map {
+                $0 ?? MLXArray.zeros([0], type: Float.self)
+            }
+        }
+        set {
+            precondition(newValue.count == 5, "DeepseekV41LayerCache state holds 5 arrays")
+            let fields = newValue.map { $0.ndim == 1 && $0.size == 0 ? nil : $0 }
+            (window, compressKV, indexK, pendingKV, pendingGate) =
+                (fields[0], fields[1], fields[2], fields[3], fields[4])
+        }
+    }
+
+    /// The offset, then one comma-separated Engram history per batch row.
+    public override var metaState: [String] {
+        get { [String(offset)] + engramHistory.map { $0.map(String.init).joined(separator: ",") } }
+        set {
+            guard let first = newValue.first, let restored = Int(first) else {
+                preconditionFailure("DeepseekV41LayerCache metaState starts with the offset")
+            }
+            offset = restored
+            engramHistory = newValue.dropFirst().map { row in
+                row.split(separator: ",").compactMap { Int64($0) }
+            }
+        }
     }
 }
 
