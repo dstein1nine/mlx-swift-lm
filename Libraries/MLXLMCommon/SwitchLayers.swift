@@ -813,17 +813,11 @@ open class SwitchGLU: Module, @unchecked Sendable {
                         let r = ranges[expertIdx]
                         switch projIdx {
                         case 0:
-                            let ssd = self.gateProj.resolveSSDInfo(expertIndex: r.id) ?? (gateSSD.path, gateSSD.tensorName, UInt32(r.id))
-                            MLXFast.preadInto(self._persistentGate![expertIdx], safetensorsPath: ssd.path,
-                                              tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                            self.gateProj.readExpert(r.id, into: self._persistentGate![expertIdx], fallback: gateSSD)
                         case 1:
-                            let ssd = self.upProj.resolveSSDInfo(expertIndex: r.id) ?? (upSSD.path, upSSD.tensorName, UInt32(r.id))
-                            MLXFast.preadInto(self._persistentUp![expertIdx], safetensorsPath: ssd.path,
-                                              tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                            self.upProj.readExpert(r.id, into: self._persistentUp![expertIdx], fallback: upSSD)
                         default:
-                            let ssd = self.downProj.resolveSSDInfo(expertIndex: r.id) ?? (downSSD.path, downSSD.tensorName, UInt32(r.id))
-                            MLXFast.preadInto(self._persistentDown![expertIdx], safetensorsPath: ssd.path,
-                                              tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                            self.downProj.readExpert(r.id, into: self._persistentDown![expertIdx], fallback: downSSD)
                         }
                         }
                     }
@@ -864,17 +858,11 @@ open class SwitchGLU: Module, @unchecked Sendable {
                             let expertId = prevIds[slot]
                             switch proj {
                             case 0:
-                                let ssd = self.gateProj.resolveSSDInfo(expertIndex: expertId) ?? (gateSSD.path, gateSSD.tensorName, UInt32(expertId))
-                                MLXFast.preadInto(self._persistentGate![slot], safetensorsPath: ssd.path,
-                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                                self.gateProj.readExpert(expertId, into: self._persistentGate![slot], fallback: gateSSD)
                             case 1:
-                                let ssd = self.upProj.resolveSSDInfo(expertIndex: expertId) ?? (upSSD.path, upSSD.tensorName, UInt32(expertId))
-                                MLXFast.preadInto(self._persistentUp![slot], safetensorsPath: ssd.path,
-                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                                self.upProj.readExpert(expertId, into: self._persistentUp![slot], fallback: upSSD)
                             default:
-                                let ssd = self.downProj.resolveSSDInfo(expertIndex: expertId) ?? (downSSD.path, downSSD.tensorName, UInt32(expertId))
-                                MLXFast.preadInto(self._persistentDown![slot], safetensorsPath: ssd.path,
-                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                                self.downProj.readExpert(expertId, into: self._persistentDown![slot], fallback: downSSD)
                             }
                             }
                         }
@@ -956,23 +944,11 @@ open class SwitchGLU: Module, @unchecked Sendable {
                                 let info = missInfo[mIdx]
                                 switch proj {
                                 case 0:
-                                    let ssd = self.gateProj.resolveSSDInfo(expertIndex: info.expertId) ?? (gateSSD.path, gateSSD.tensorName, UInt32(info.expertId))
-                                    MLXFast.preadInto(self._persistentGate![info.bufferSlot],
-                                                      safetensorsPath: ssd.path,
-                                                      tensorName: ssd.tensorName,
-                                                      expertIndex: ssd.readIndex)
+                                    self.gateProj.readExpert(info.expertId, into: self._persistentGate![info.bufferSlot], fallback: gateSSD)
                                 case 1:
-                                    let ssd = self.upProj.resolveSSDInfo(expertIndex: info.expertId) ?? (upSSD.path, upSSD.tensorName, UInt32(info.expertId))
-                                    MLXFast.preadInto(self._persistentUp![info.bufferSlot],
-                                                      safetensorsPath: ssd.path,
-                                                      tensorName: ssd.tensorName,
-                                                      expertIndex: ssd.readIndex)
+                                    self.upProj.readExpert(info.expertId, into: self._persistentUp![info.bufferSlot], fallback: upSSD)
                                 default:
-                                    let ssd = self.downProj.resolveSSDInfo(expertIndex: info.expertId) ?? (downSSD.path, downSSD.tensorName, UInt32(info.expertId))
-                                    MLXFast.preadInto(self._persistentDown![info.bufferSlot],
-                                                      safetensorsPath: ssd.path,
-                                                      tensorName: ssd.tensorName,
-                                                      expertIndex: ssd.readIndex)
+                                    self.downProj.readExpert(info.expertId, into: self._persistentDown![info.bufferSlot], fallback: downSSD)
                                 }
                                 }
                             }
@@ -999,17 +975,11 @@ open class SwitchGLU: Module, @unchecked Sendable {
                             let r = ranges[expertIdx]
                             switch projIdx {
                             case 0:
-                                let ssd = self.gateProj.resolveSSDInfo(expertIndex: r.id) ?? (gateSSD.path, gateSSD.tensorName, UInt32(r.id))
-                                MLXFast.preadInto(self._persistentGate![expertIdx], safetensorsPath: ssd.path,
-                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                                self.gateProj.readExpert(r.id, into: self._persistentGate![expertIdx], fallback: gateSSD)
                             case 1:
-                                let ssd = self.upProj.resolveSSDInfo(expertIndex: r.id) ?? (upSSD.path, upSSD.tensorName, UInt32(r.id))
-                                MLXFast.preadInto(self._persistentUp![expertIdx], safetensorsPath: ssd.path,
-                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                                self.upProj.readExpert(r.id, into: self._persistentUp![expertIdx], fallback: upSSD)
                             default:
-                                let ssd = self.downProj.resolveSSDInfo(expertIndex: r.id) ?? (downSSD.path, downSSD.tensorName, UInt32(r.id))
-                                MLXFast.preadInto(self._persistentDown![expertIdx], safetensorsPath: ssd.path,
-                                                  tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                                self.downProj.readExpert(r.id, into: self._persistentDown![expertIdx], fallback: downSSD)
                             }
                             }
                         }
@@ -1071,17 +1041,11 @@ open class SwitchGLU: Module, @unchecked Sendable {
                     let r = ranges[expertIdx]
                     switch projIdx {
                     case 0:
-                        let ssd = self.gateProj.resolveSSDInfo(expertIndex: r.id) ?? (gateSSD.path, gateSSD.tensorName, UInt32(r.id))
-                        MLXFast.preadInto(gateBuffers[expertIdx], safetensorsPath: ssd.path,
-                                          tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                        self.gateProj.readExpert(r.id, into: gateBuffers[expertIdx], fallback: gateSSD)
                     case 1:
-                        let ssd = self.upProj.resolveSSDInfo(expertIndex: r.id) ?? (upSSD.path, upSSD.tensorName, UInt32(r.id))
-                        MLXFast.preadInto(upBuffers[expertIdx], safetensorsPath: ssd.path,
-                                          tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                        self.upProj.readExpert(r.id, into: upBuffers[expertIdx], fallback: upSSD)
                     default:
-                        let ssd = self.downProj.resolveSSDInfo(expertIndex: r.id) ?? (downSSD.path, downSSD.tensorName, UInt32(r.id))
-                        MLXFast.preadInto(downBuffers[expertIdx], safetensorsPath: ssd.path,
-                                          tensorName: ssd.tensorName, expertIndex: ssd.readIndex)
+                        self.downProj.readExpert(r.id, into: downBuffers[expertIdx], fallback: downSSD)
                     }
                     }
                 }
@@ -1315,6 +1279,27 @@ open class SwitchLinear: Module, Quantizable {
         #else
         return nil
         #endif
+    }
+
+    /// Reads expert `expertIndex`'s weight into `dst`. A per-expert tensor is read by offset:
+    /// the C reader caches by tensor name, so it reparsed a shard header per expert.
+    public func readExpert(
+        _ expertIndex: Int, into dst: MLXArray, fallback: (path: String, tensorName: String)
+    ) {
+        if unstackedSSDMap?[expertIndex] != nil,
+            let extent = try? ssdExtent(expertIndex: expertIndex)
+        {
+            MLXFast.preadRangeInto(
+                dst, dstOffset: 0, path: extent.path, fileOffset: extent.fileOffset,
+                length: extent.length)
+            return
+        }
+        let ssd =
+            resolveSSDInfo(expertIndex: expertIndex)
+            ?? (fallback.path, fallback.tensorName, UInt32(expertIndex))
+        MLXFast.preadInto(
+            dst, safetensorsPath: ssd.path, tensorName: ssd.tensorName,
+            expertIndex: ssd.readIndex)
     }
 
     /// File extent of one expert's weight, with the same offsets `MLXFast.preadInto` uses.
@@ -1755,13 +1740,7 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
 
                 // ---- Sequential pread into each fresh buffer ----
                 for (i, r) in ranges.enumerated() {
-                    let ssd = self.resolveSSDInfo(expertIndex: r.id) ?? (info.path, info.tensorName, UInt32(r.id))
-                    MLXFast.preadInto(
-                        buffers[i],
-                        safetensorsPath: ssd.path,
-                        tensorName: ssd.tensorName,
-                        expertIndex: ssd.readIndex
-                    )
+                    readExpert(r.id, into: buffers[i], fallback: info)
                 }
 
                 // ---- GPU compute for all experts ----
@@ -1878,13 +1857,7 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
     /// Load expert weights from SSD into pre-allocated (eval'd) buffers.
     public func loadExpertWeights(_ buffers: [MLXArray], ranges: [ExpertRange], ssdInfo: (path: String, tensorName: String)) {
         for (i, r) in ranges.enumerated() {
-            let ssd = self.resolveSSDInfo(expertIndex: r.id) ?? (ssdInfo.path, ssdInfo.tensorName, UInt32(r.id))
-            MLXFast.preadInto(
-                buffers[i],
-                safetensorsPath: ssd.path,
-                tensorName: ssd.tensorName,
-                expertIndex: ssd.readIndex
-            )
+            readExpert(r.id, into: buffers[i], fallback: ssdInfo)
         }
     }
 
