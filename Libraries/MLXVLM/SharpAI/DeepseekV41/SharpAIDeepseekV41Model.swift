@@ -227,19 +227,61 @@ public final class DeepseekV41LayerCache: BaseKVCache {
 
 // MARK: - Attention pieces
 
-/// A block-diagonal projection: one [out, in] matrix per output group.
-public final class DeepseekV41BlockLinear: Module {
-    @ParameterInfo(key: "weight") var weight: MLXArray
+/// A block-diagonal projection: one [out, in] matrix per output group, stored stacked as
+/// [groups * out, in] like the checkpoint's `wo_a`.
+public final class DeepseekV41BlockLinear: Module, UnaryLayer, Quantizable {
+    let groups: Int
+    @ParameterInfo(key: "weight") public var weight: MLXArray
 
-    init(inputDims: Int, outputDims: Int, groups: Int) {
+    public init(inputDims: Int, outputDims: Int, groups: Int) {
+        self.groups = groups
         self._weight.wrappedValue = MLXArray.zeros(
-            [groups, outputDims, inputDims], type: Float.self)
+            [groups * outputDims, inputDims], type: Float.self)
         super.init()
     }
 
     /// [N, G, in] -> [N, G, out]
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        matmul(x.expandedDimensions(axis: -2), weight.transposed(0, 2, 1)).squeezed(axis: -2)
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let w = weight.reshaped(groups, -1, weight.dim(-1))
+        return matmul(x.expandedDimensions(axis: -2), w.transposed(0, 2, 1)).squeezed(axis: -2)
+    }
+
+    public func toQuantized(groupSize: Int, bits: Int, mode: QuantizationMode) -> Module {
+        DeepseekV41QuantizedBlockLinear(self, groupSize: groupSize, bits: bits, mode: mode)
+    }
+}
+
+public final class DeepseekV41QuantizedBlockLinear: Module, UnaryLayer, Quantized {
+    public let groupSize: Int
+    public let bits: Int
+    public let mode: QuantizationMode
+    let groups: Int
+    @ParameterInfo(key: "weight") public var weight: MLXArray
+    @ParameterInfo(key: "scales") public var scales: MLXArray
+    @ParameterInfo(key: "biases") public var biases: MLXArray?
+
+    init(_ other: DeepseekV41BlockLinear, groupSize: Int, bits: Int, mode: QuantizationMode) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self.groups = other.groups
+        let (w, s, b) = quantized(other.weight, groupSize: groupSize, bits: bits, mode: mode)
+        self._weight.wrappedValue = w
+        self._scales.wrappedValue = s
+        self._biases.wrappedValue = b
+        super.init()
+        self.freeze()
+    }
+
+    /// [N, G, in] -> [N, G, out]; one gathered matmul, group g against rows g*out ..< (g+1)*out.
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        func byGroup(_ a: MLXArray) -> MLXArray { a.reshaped(groups, -1, a.dim(-1)) }
+        return gatherQuantizedMM(
+            x.expandedDimensions(axis: -2), byGroup(weight), scales: byGroup(scales),
+            biases: biases.map(byGroup),
+            rhsIndices: MLXArray(0 ..< Int32(groups)).reshaped(1, groups),
+            transpose: true, groupSize: groupSize, bits: bits, mode: mode
+        ).squeezed(axis: -2)
     }
 }
 
@@ -418,7 +460,7 @@ public final class DeepseekV41Attention: Module {
     @ModuleInfo(key: "q_b_proj") var qBProj: Linear
     @ModuleInfo(key: "kv_proj") var kvProj: Linear
     @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
-    @ModuleInfo(key: "o_a_proj") var oAProj: DeepseekV41BlockLinear
+    @ModuleInfo(key: "o_a_proj") var oAProj: UnaryLayer
     @ModuleInfo(key: "o_b_proj") var oBProj: Linear
     @ModuleInfo(key: "compressor") var compressor: DeepseekV41Compressor?
     @ModuleInfo(key: "indexer") var indexer: DeepseekV41Indexer?

@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import MLXVLM
 import XCTest
 
@@ -131,5 +132,40 @@ final class SharpAIDeepseekV41ModelTests: XCTestCase {
         XCTAssertEqual(stacked.shape, [2, 2, 2])
         XCTAssertEqual(stacked[1].sum().item(Float.self), 8)
         XCTAssertNil(result["layers.1.ffn.experts.0.w1.weight"])
+    }
+
+    /// Group g of o_a_proj uses rows g*out ..< (g+1)*out of the stacked [groups * out, in] weight,
+    /// as the reference's `wo_a.weight.view(n_groups, o_lora_rank, -1)`; quantized or not.
+    func testBlockLinearAppliesEachGroupItsOwnRows() throws {
+        let (groups, out, inputs) = (3, 8, 64)
+        let block = DeepseekV41BlockLinear(inputDims: inputs, outputDims: out, groups: groups)
+        try block.update(
+            parameters: ModuleParameters.unflattened([
+                "weight": sin(0.37 * MLXArray(0 ..< (groups * out * inputs)).asType(.float32))
+                    .reshaped(groups * out, inputs)
+            ]), verify: .all)
+        let x = cos(0.11 * MLXArray(0 ..< (5 * groups * inputs)).asType(.float32))
+            .reshaped(5, groups, inputs)
+
+        func reference(_ weight: MLXArray) -> MLXArray {
+            stacked(
+                (0 ..< groups).map { g in
+                    matmul(x[0..., g], weight[(g * out) ..< ((g + 1) * out)].T)
+                }, axis: 1)
+        }
+
+        XCTAssertEqual(block(x).shape, [5, groups, out])
+        XCTAssertEqual(
+            abs(block(x) - reference(block.weight)).max().item(Float.self), 0, accuracy: 1e-4)
+
+        let quantizedBlock = try XCTUnwrap(
+            quantizeSingle(layer: block, groupSize: 32, bits: 8) as? DeepseekV41QuantizedBlockLinear
+        )
+        let dequantizedWeight = dequantized(
+            quantizedBlock.weight, scales: quantizedBlock.scales, biases: quantizedBlock.biases,
+            groupSize: 32, bits: 8, dtype: .float32)
+        XCTAssertEqual(
+            abs(quantizedBlock(x) - reference(dequantizedWeight)).max().item(Float.self), 0,
+            accuracy: 1e-3)
     }
 }
