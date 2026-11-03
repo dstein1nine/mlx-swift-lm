@@ -105,7 +105,12 @@ final class SharpAIDeepseekV41StreamingTests: XCTestCase {
             XCTAssertEqual(sl.unstackedSSDMap?.count, 4)
             XCTAssertTrue(sl is QuantizedSwitchLinear)
         }
+        let before = StreamEngine.shared.snapshot()
         let (streamedPrefill, streamedDecode) = run(streamed)
+        let after = StreamEngine.shared.snapshot()
+        // Decode must take the stacked slot path, which reads through the stream engine.
+        XCTAssertGreaterThan(after.misses, before.misses)
+        XCTAssertGreaterThan(after.bytesRead, before.bytesRead)
 
         XCTAssertEqual(streamedPrefill.shape, residentPrefill.shape)
         XCTAssertEqual(

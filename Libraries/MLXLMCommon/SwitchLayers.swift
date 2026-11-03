@@ -1323,6 +1323,10 @@ open class SwitchLinear: Module, Quantizable {
             throw SafetensorsLayoutError(description: "no SSD source for expert \(expertIndex)")
         }
         let tensor = try SafetensorsLayout.shared.tensor(ssd.tensorName, in: ssd.path)
+        // A per-expert (unstacked) tensor is the whole expert, not a stack to slice.
+        if unstackedSSDMap?[expertIndex] != nil {
+            return UnitExtent(path: ssd.path, fileOffset: tensor.dataStart, length: tensor.byteLength)
+        }
         guard let extent = tensor.slab(Int(ssd.readIndex), path: ssd.path) else {
             throw SafetensorsLayoutError(
                 description: "expert \(ssd.readIndex) out of range for \(ssd.tensorName)")
