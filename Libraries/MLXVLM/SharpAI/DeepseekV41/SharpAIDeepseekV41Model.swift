@@ -804,6 +804,8 @@ public final class DeepseekV41DecoderLayer: Module {
     /// Later layers, nearest first, for expert prefetch during streaming decode
     /// (`MLX_MOE_PREFETCH_TOPK`, `MLX_MOE_PREFETCH_DEPTH`).
     var lookaheadLinks: [DeepseekV41LookaheadLink] = []
+    /// The next layer, for expert prefetch during streamed prompt chunks.
+    var promptLink: DeepseekV41LookaheadLink?
 
     init(_ args: SharpAIDeepseekV41TextConfiguration, layerId: Int) {
         self.layerId = layerId
@@ -843,6 +845,12 @@ public final class DeepseekV41DecoderLayer: Module {
             mlp.experts.switchMLP.lookahead = lookaheadLinks.map {
                 ExpertLookahead(predicted: $0.predict(collapsed), target: $0.target)
             }
+        }
+        if !decoding, let promptLink, SwitchGLU.promptPipeline,
+            ExpertStreamingConfig.shared.isEnabled
+        {
+            mlp.experts.switchMLP.promptLookahead = ExpertLookahead(
+                predicted: promptLink.predict(collapsed), target: promptLink.target)
         }
         let m = mlp(postAttentionLayernorm(collapsed))
         let out = deepseekV41Expand(m, residual: afterAttention, post: ffnPost, comb: ffnComb)
@@ -894,6 +902,10 @@ public final class DeepseekV41TextModel: Module, StreamableMoE {
         self._norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
         super.init()
 
+        for (layer, next) in zip(layers, layers.dropFirst()) {
+            layer.promptLink = DeepseekV41LookaheadLink(
+                next: next, topK: SwitchGLU.promptPredictTopK ?? args.numExpertsPerTok)
+        }
         let k = min(SwitchGLU.lookaheadTopK, args.nRoutedExperts)
         if k > 0 {
             for i in layers.indices {

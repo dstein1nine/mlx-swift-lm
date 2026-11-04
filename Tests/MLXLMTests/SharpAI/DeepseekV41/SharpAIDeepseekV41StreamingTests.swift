@@ -72,8 +72,9 @@ final class SharpAIDeepseekV41StreamingTests: XCTestCase {
         return model
     }
 
-    /// Logits of a 20-token prefill (40 routed pairs: the per-projection read path) and of
-    /// six single-token decode steps after it (the stacked slot path).
+    /// Logits of a 20-token prefill (40 routed pairs: the prompt path, with layers 1-2
+    /// prefetched by the prompt pipeline) and of six single-token decode steps after it
+    /// (the stacked slot path).
     private func run(_ model: SharpAIDeepseekV41Model) -> (MLXArray, MLXArray) {
         let tokens = MLXArray((0 ..< 26).map { Int32(($0 * 7 + 3) % 64) }).reshaped(1, 26)
         let cache = model.newCache(parameters: nil)

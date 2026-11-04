@@ -203,6 +203,26 @@ open class SwitchGLU: Module, @unchecked Sendable {
     /// Guesses for later layers' experts, set by the model before this layer runs.
     public var lookahead: [ExpertLookahead] = []
 
+    /// On prompt chunks, read the next layer's predicted experts in the background while
+    /// this layer and the next one's attention compute. `MLX_MOE_PROMPT_PIPELINE=0` disables.
+    public static let promptPipeline: Bool = {
+        let v = ProcessInfo.processInfo.environment["MLX_MOE_PROMPT_PIPELINE"] ?? "1"
+        return v == "1" || v.lowercased() == "true"
+    }()
+
+    /// Router guesses per token for the prompt pipeline; nil uses the model's top-k.
+    /// `MLX_MOE_PROMPT_PREDICT_K=N`.
+    public static let promptPredictTopK: Int? =
+        Int(ProcessInfo.processInfo.environment["MLX_MOE_PROMPT_PREDICT_K"] ?? "").flatMap {
+            $0 > 0 ? $0 : nil
+        }
+
+    /// The next layer's experts for this prompt chunk, guessed by running its router on
+    /// this layer's hidden state. Set by the model before this layer runs.
+    public var promptLookahead: ExpertLookahead?
+    /// Experts the previous layer is reading for this one.
+    private var promptPrefetch: PromptPrefetch?
+
     /// Background reads claimed for this layer during the current token, oldest first.
     private var _pendingPrefetches: [PendingPrefetch] = []
     /// Reads for wrong guesses that were still running when routing resolved.
@@ -687,6 +707,36 @@ open class SwitchGLU: Module, @unchecked Sendable {
     /// Identity by default — see `transformInput`.
     func transformHidden(_ x: MLXArray) -> MLXArray { x }
 
+    /// Reads `experts` into `claim`'s buffers on a background queue, for this layer's next
+    /// prompt chunk to wait on.
+    fileprivate func startPromptPrefetch(_ claim: PromptExpertClaim, experts: Set<Int>) {
+        guard let gateSSD = gateProj.resolveSSDInfo(), let upSSD = upProj.resolveSSDInfo(),
+            let downSSD = downProj.resolveSSDInfo()
+        else { return }
+        let prefetch = PromptPrefetch(claim: claim, experts: experts)
+        let ids = Array(experts)
+        let set = claim.buffers
+        prefetch.group.enter()
+        Self.prefetchQueue.async {
+            defer { prefetch.group.leave() }
+            let readStart = DispatchTime.now().uptimeNanoseconds
+            DispatchQueue.concurrentPerform(iterations: ids.count * 3) { i in
+                prefetch.errors.catchError {
+                    let e = ids[i / 3]
+                    switch i % 3 {
+                    case 0: self.gateProj.readExpert(e, into: set.gate[e], fallback: gateSSD)
+                    case 1: self.upProj.readExpert(e, into: set.up[e], fallback: upSSD)
+                    default: self.downProj.readExpert(e, into: set.down[e], fallback: downSSD)
+                    }
+                }
+            }
+            StreamEngine.shared.recordPromptRead(
+                bytes: ids.reduce(0) { $0 + set.gate[$1].nbytes + set.up[$1].nbytes + set.down[$1].nbytes },
+                nanos: DispatchTime.now().uptimeNanoseconds - readStart)
+        }
+        promptPrefetch = prefetch
+    }
+
     /// Project and sort tokens through the three expert matmuls, returning the
     /// (still-sorted, still-unsqueezed) output alongside the inverse
     /// permutation needed to restore token order — the shared primitive both
@@ -756,6 +806,10 @@ open class SwitchGLU: Module, @unchecked Sendable {
                 // Buffers are sized on first use (usually top_k). A call that routes
                 // more (e.g. an MTP verify step) must regrow them, or slot lookups
                 // index past the end.
+                promptLookahead = nil
+                promptPrefetch?.wait()
+                promptPrefetch = nil
+                PromptExpertPool.release()
                 let plan = persistentBufferPlan(
                     allocated: _persistentGate?.count, needed: idx.size)
                 if plan.regrow {
@@ -999,7 +1053,9 @@ open class SwitchGLU: Module, @unchecked Sendable {
             } else {
                 // ── PROMPT PATH: larger batches ──
                 // Eval indices first (needed for range count), then allocate exact buffers.
-                MLX.eval(idx)
+                let ahead = Self.promptPipeline ? promptLookahead : nil
+                promptLookahead = nil
+                MLX.eval([idx] + (ahead.map { [$0.predicted] } ?? []))
 
                 // Handle empty indices
                 if idx.size == 0 {
@@ -1024,35 +1080,62 @@ open class SwitchGLU: Module, @unchecked Sendable {
                     startIdx = endIdx
                 }
 
+                // Experts the previous layer read ahead for this chunk, if its set is intact.
+                let prefetch = promptPrefetch
+                promptPrefetch = nil
+                prefetch?.wait()
+                let ready = prefetch.flatMap { $0.claim.isValid ? $0 : nil }
+                let missing = ranges.indices.filter { ready?.experts.contains(ranges[$0].id) != true }
+
                 // Allocate exact buffer count and eval
-                let gateBuffers = gateProj.allocateExpertBuffers(ranges.count)
-                let upBuffers = upProj.allocateExpertBuffers(ranges.count)
-                let downBuffers = downProj.allocateExpertBuffers(ranges.count)
-                MLX.eval(gateBuffers + upBuffers + downBuffers)
+                let missGate = gateProj.allocateExpertBuffers(missing.count)
+                let missUp = upProj.allocateExpertBuffers(missing.count)
+                let missDown = downProj.allocateExpertBuffers(missing.count)
+                MLX.eval(missGate + missUp + missDown)
+                var gateBuffers = ranges.map { ready?.claim.buffers.gate[$0.id] ?? MLXArray() }
+                var upBuffers = ranges.map { ready?.claim.buffers.up[$0.id] ?? MLXArray() }
+                var downBuffers = ranges.map { ready?.claim.buffers.down[$0.id] ?? MLXArray() }
+                for (m, r) in missing.enumerated() {
+                    gateBuffers[r] = missGate[m]
+                    upBuffers[r] = missUp[m]
+                    downBuffers[r] = missDown[m]
+                }
 
                 // Concurrent pread (same as fast path)
-                let totalReads = ranges.count * 3
+                let totalReads = missing.count * 3
                 let errState = ThreadSafeError()
                 let readStart = DispatchTime.now().uptimeNanoseconds
                 DispatchQueue.concurrentPerform(iterations: totalReads) { [ranges] i in
                     errState.catchError {
-                    let expertIdx = i / 3
-                    let projIdx = i % 3
-                    let r = ranges[expertIdx]
-                    switch projIdx {
+                    let m = i / 3
+                    let r = ranges[missing[m]]
+                    switch i % 3 {
                     case 0:
-                        self.gateProj.readExpert(r.id, into: gateBuffers[expertIdx], fallback: gateSSD)
+                        self.gateProj.readExpert(r.id, into: missGate[m], fallback: gateSSD)
                     case 1:
-                        self.upProj.readExpert(r.id, into: upBuffers[expertIdx], fallback: upSSD)
+                        self.upProj.readExpert(r.id, into: missUp[m], fallback: upSSD)
                     default:
-                        self.downProj.readExpert(r.id, into: downBuffers[expertIdx], fallback: downSSD)
+                        self.downProj.readExpert(r.id, into: missDown[m], fallback: downSSD)
                     }
                     }
                 }
                 errState.check()
                 StreamEngine.shared.recordPromptRead(
-                    bytes: (gateBuffers + upBuffers + downBuffers).reduce(0) { $0 + $1.nbytes },
+                    bytes: (missGate + missUp + missDown).reduce(0) { $0 + $1.nbytes },
                     nanos: DispatchTime.now().uptimeNanoseconds - readStart)
+                if PromptPrefetch.debug, let ready {
+                    let used = Set(ranges.map(\.id))
+                    print("[prompt-pipeline] used \(used.count) prefetched \(ready.experts.count) "
+                        + "hit \(used.intersection(ready.experts).count) missed \(missing.count)")
+                }
+
+                // Start reading the next layer's predicted experts. Its buffers alternate
+                // with this layer's, which the GPU finishes before the next layer routes.
+                if let ahead {
+                    let predicted = Set(ahead.predicted.asArray(Int32.self).map(Int.init))
+                    ahead.target.startPromptPrefetch(
+                        PromptExpertPool.claim(for: ahead.target), experts: predicted)
+                }
 
                 // Lazy compute (no eval — next layer forces it)
                 let xGate = gateProj.computeExperts(x, buffers: gateBuffers, ranges: ranges)
@@ -1946,6 +2029,82 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
             output = output.reshaped(canonicalShape)
         }
         return output
+    }
+}
+
+/// Buffers for every expert of one layer, used by the prompt pipeline.
+final class PromptExpertSet {
+    let gate: [MLXArray]
+    let up: [MLXArray]
+    let down: [MLXArray]
+    /// Changes each time the set is handed to a layer, so older claims can tell.
+    var stamp: UInt64 = 0
+
+    init(like layer: SwitchGLU) {
+        let n = layer.gateProj.numExperts
+        gate = layer.gateProj.allocateExpertBuffers(n)
+        up = layer.upProj.allocateExpertBuffers(n)
+        down = layer.downProj.allocateExpertBuffers(n)
+        MLX.eval(gate + up + down)
+    }
+
+    func fits(_ layer: SwitchGLU) -> Bool {
+        gate.count == layer.gateProj.numExperts
+            && gate.first?.shape == layer.gateProj.allocateExpertBuffers(1).first?.shape
+    }
+}
+
+/// A set handed to one layer; invalid once it is handed to another.
+struct PromptExpertClaim {
+    let buffers: PromptExpertSet
+    let stamp: UInt64
+    var isValid: Bool { buffers.stamp == stamp }
+}
+
+/// A background read of a layer's predicted experts for its next prompt chunk.
+final class PromptPrefetch: @unchecked Sendable {
+    /// `MLX_MOE_PROMPT_DEBUG=1` prints how well each layer's prediction covered it.
+    static let debug = ProcessInfo.processInfo.environment["MLX_MOE_PROMPT_DEBUG"] == "1"
+
+    let claim: PromptExpertClaim
+    let experts: Set<Int>
+    let group = DispatchGroup()
+    let errors = ThreadSafeError()
+
+    init(claim: PromptExpertClaim, experts: Set<Int>) {
+        self.claim = claim
+        self.experts = experts
+    }
+
+    /// Blocks until the read finishes, and reports its errors here.
+    func wait() {
+        group.wait()
+        errors.check()
+    }
+}
+
+/// Two alternating sets. Layer i's prefetch is read into one while layer i-1 computes from
+/// the other; layer i+1's goes back to the first only after layer i has routed, which
+/// waits for layer i-1's compute.
+enum PromptExpertPool {
+    nonisolated(unsafe) private static var sets: [PromptExpertSet] = []
+    nonisolated(unsafe) private static var turn = 0
+    nonisolated(unsafe) private static var stamp: UInt64 = 0
+
+    static func claim(for layer: SwitchGLU) -> PromptExpertClaim {
+        if sets.count < 2 || !sets[turn].fits(layer) {
+            sets = [PromptExpertSet(like: layer), PromptExpertSet(like: layer)]
+        }
+        let set = sets[turn]
+        turn ^= 1
+        stamp += 1
+        set.stamp = stamp
+        return PromptExpertClaim(buffers: set, stamp: stamp)
+    }
+
+    /// Frees the sets (two layers of experts) once decode starts.
+    static func release() {
+        if !sets.isEmpty { sets = [] }
     }
 }
 
