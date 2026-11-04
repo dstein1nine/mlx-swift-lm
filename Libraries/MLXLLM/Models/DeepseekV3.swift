@@ -270,7 +270,8 @@ class MoEGate: Module {
         let (bsz, seqLen, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         let hiddenStates = x.matmul(weight.T)
-        var scores = sigmoid(hiddenStates)
+        let originalScores = sigmoid(hiddenStates.asType(.float32))
+        var scores = originalScores
         let scoresForChoice = scores + e_score_correction_bias
         let groupScores = scoresForChoice.reshaped(bsz, seqLen, self.nGroup, -1)
         let topKGroup = top(groupScores, k: 2, axis: -1).sum(axis: -1, keepDims: true)
@@ -282,14 +283,12 @@ class MoEGate: Module {
 
         k = topK ?? 1
         let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
-        scores = takeAlong(scores, inds, axis: -1)
+        // The bias only picks the experts; their weights come from the unbiased scores.
+        var weights = takeAlong(originalScores, inds, axis: -1)
         if topK ?? 1 > 1, normTopkProb {
-            let denominator = scores.sum(axis: -1, keepDims: true) + 1e-20
-            scores = scores / denominator
-            scores = scores * routedScalingFactor
+            weights = weights / (weights.sum(axis: -1, keepDims: true) + 1e-20)
         }
-
-        return (inds, scores)
+        return (inds, weights * routedScalingFactor)
     }
 }
 
