@@ -210,6 +210,17 @@ open class SwitchGLU: Module, @unchecked Sendable {
         return v == "1" || v.lowercased() == "true"
     }()
 
+    /// Shortest prompt chunk the pipeline runs on. Below it a layer uses only some of its
+    /// experts and wrong guesses cost more reads than the overlap saves (Kimi K2.6: ~140
+    /// tokens 5-18% slower, ~540 even, 1K 7% faster, 4K 30%). `MLX_MOE_PROMPT_PIPELINE_MIN_TOKENS=N`.
+    nonisolated(unsafe) public static var promptPipelineMinTokens: Int =
+        Int(ProcessInfo.processInfo.environment["MLX_MOE_PROMPT_PIPELINE_MIN_TOKENS"] ?? "") ?? 512
+
+    /// Whether a model should set `promptLookahead` for a prompt chunk of `tokens` tokens.
+    public static func usesPromptPipeline(tokens: Int) -> Bool {
+        promptPipeline && tokens >= promptPipelineMinTokens && ExpertStreamingConfig.shared.isEnabled
+    }
+
     /// Router guesses per token for the prompt pipeline; nil uses the model's top-k.
     /// `MLX_MOE_PROMPT_PREDICT_K=N`.
     public static let promptPredictTopK: Int? =
@@ -340,6 +351,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
               downProj.resolveSSDInfo() != nil else {
             return nil  // ineligible — fall through to legacy path
         }
+        endPromptPipeline()
 
         let CACHE_SLOTS = SwitchGLU.MAX_CACHE_SLOTS
         let isFused = SwitchGLU.useFusedGateUp
@@ -707,6 +719,14 @@ open class SwitchGLU: Module, @unchecked Sendable {
     /// Identity by default — see `transformInput`.
     func transformHidden(_ x: MLXArray) -> MLXArray { x }
 
+    /// Decode has started: drop any prompt prefetch state and free the shared buffers.
+    private func endPromptPipeline() {
+        promptLookahead = nil
+        promptPrefetch?.wait()
+        promptPrefetch = nil
+        PromptExpertPool.release()
+    }
+
     /// Reads `experts` into `claim`'s buffers on a background queue, for this layer's next
     /// prompt chunk to wait on.
     fileprivate func startPromptPrefetch(_ claim: PromptExpertClaim, experts: Set<Int>) {
@@ -724,14 +744,14 @@ open class SwitchGLU: Module, @unchecked Sendable {
                 prefetch.errors.catchError {
                     let e = ids[i / 3]
                     switch i % 3 {
-                    case 0: self.gateProj.readExpert(e, into: set.gate[e], fallback: gateSSD)
-                    case 1: self.upProj.readExpert(e, into: set.up[e], fallback: upSSD)
-                    default: self.downProj.readExpert(e, into: set.down[e], fallback: downSSD)
+                    case 0: self.gateProj.readExpert(e, into: set.gate[e]!, fallback: gateSSD)
+                    case 1: self.upProj.readExpert(e, into: set.up[e]!, fallback: upSSD)
+                    default: self.downProj.readExpert(e, into: set.down[e]!, fallback: downSSD)
                     }
                 }
             }
             StreamEngine.shared.recordPromptRead(
-                bytes: ids.reduce(0) { $0 + set.gate[$1].nbytes + set.up[$1].nbytes + set.down[$1].nbytes },
+                bytes: ids.reduce(0) { $0 + set.gate[$1]!.nbytes + set.up[$1]!.nbytes + set.down[$1]!.nbytes },
                 nanos: DispatchTime.now().uptimeNanoseconds - readStart)
         }
         promptPrefetch = prefetch
@@ -806,10 +826,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
                 // Buffers are sized on first use (usually top_k). A call that routes
                 // more (e.g. an MTP verify step) must regrow them, or slot lookups
                 // index past the end.
-                promptLookahead = nil
-                promptPrefetch?.wait()
-                promptPrefetch = nil
-                PromptExpertPool.release()
+                endPromptPipeline()
                 let plan = persistentBufferPlan(
                     allocated: _persistentGate?.count, needed: idx.size)
                 if plan.regrow {
@@ -1134,7 +1151,8 @@ open class SwitchGLU: Module, @unchecked Sendable {
                 if let ahead {
                     let predicted = Set(ahead.predicted.asArray(Int32.self).map(Int.init))
                     ahead.target.startPromptPrefetch(
-                        PromptExpertPool.claim(for: ahead.target), experts: predicted)
+                        PromptExpertPool.claim(for: ahead.target, experts: predicted),
+                        experts: predicted)
                 }
 
                 // Lazy compute (no eval — next layer forces it)
@@ -2032,25 +2050,35 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
     }
 }
 
-/// Buffers for every expert of one layer, used by the prompt pipeline.
+/// Expert buffers for one layer, used by the prompt pipeline. Allocated per expert as
+/// predictions need them and kept across layers while the shapes match.
 final class PromptExpertSet {
-    let gate: [MLXArray]
-    let up: [MLXArray]
-    let down: [MLXArray]
+    private(set) var gate: [Int: MLXArray] = [:]
+    private(set) var up: [Int: MLXArray] = [:]
+    private(set) var down: [Int: MLXArray] = [:]
     /// Changes each time the set is handed to a layer, so older claims can tell.
     var stamp: UInt64 = 0
 
-    init(like layer: SwitchGLU) {
-        let n = layer.gateProj.numExperts
-        gate = layer.gateProj.allocateExpertBuffers(n)
-        up = layer.upProj.allocateExpertBuffers(n)
-        down = layer.downProj.allocateExpertBuffers(n)
-        MLX.eval(gate + up + down)
-    }
-
-    func fits(_ layer: SwitchGLU) -> Bool {
-        gate.count == layer.gateProj.numExperts
-            && gate.first?.shape == layer.gateProj.allocateExpertBuffers(1).first?.shape
+    /// Makes sure `experts` have buffers shaped for `layer`. A projection whose shape
+    /// differs (Kimi K2.6 mixes down_proj bit widths between layers) starts over.
+    func prepare(_ layer: SwitchGLU, experts: Set<Int>) {
+        var fresh: [MLXArray] = []
+        func fill(_ buffers: inout [Int: MLXArray], _ proj: SwitchLinear) {
+            if let probe = proj.allocateExpertBuffers(1).first, let old = buffers.first?.value,
+                old.shape != probe.shape || old.dtype != probe.dtype
+            {
+                buffers = [:]
+            }
+            let needed = experts.filter { buffers[$0] == nil }
+            for (e, b) in zip(needed, proj.allocateExpertBuffers(needed.count)) {
+                buffers[e] = b
+                fresh.append(b)
+            }
+        }
+        fill(&gate, layer.gateProj)
+        fill(&up, layer.upProj)
+        fill(&down, layer.downProj)
+        if !fresh.isEmpty { MLX.eval(fresh) }
     }
 }
 
@@ -2091,20 +2119,25 @@ enum PromptExpertPool {
     nonisolated(unsafe) private static var turn = 0
     nonisolated(unsafe) private static var stamp: UInt64 = 0
 
-    static func claim(for layer: SwitchGLU) -> PromptExpertClaim {
-        if sets.count < 2 || !sets[turn].fits(layer) {
-            sets = [PromptExpertSet(like: layer), PromptExpertSet(like: layer)]
-        }
+    static func claim(for layer: SwitchGLU, experts: Set<Int>) -> PromptExpertClaim {
+        if sets.isEmpty { sets = [PromptExpertSet(), PromptExpertSet()] }
         let set = sets[turn]
+        set.prepare(layer, experts: experts)
         turn ^= 1
         stamp += 1
         set.stamp = stamp
         return PromptExpertClaim(buffers: set, stamp: stamp)
     }
 
-    /// Frees the sets (two layers of experts) once decode starts.
+    static var isHoldingBuffers: Bool { !sets.isEmpty }
+
+    /// Frees the sets (up to two layers of experts) once decode starts, and returns the
+    /// memory to the OS file cache rather than keeping it in MLX's buffer cache.
     static func release() {
-        if !sets.isEmpty { sets = [] }
+        if !sets.isEmpty {
+            sets = []
+            Memory.clearCache()
+        }
     }
 }
 

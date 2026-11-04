@@ -99,6 +99,10 @@ final class SharpAIDeepseekV41StreamingTests: XCTestCase {
         let (residentPrefill, residentDecode) = run(try load(directory, streaming: false))
 
         defer { ExpertStreamingConfig.shared.deactivate() }
+        // The test prompt is far shorter than real chunks; run the prompt pipeline anyway.
+        let minTokens = SwitchGLU.promptPipelineMinTokens
+        SwitchGLU.promptPipelineMinTokens = 1
+        defer { SwitchGLU.promptPipelineMinTokens = minTokens }
         let streamed = try load(directory, streaming: true)
         let switches = streamed.leafModules().flattened().compactMap { $0.1 as? SwitchLinear }
         XCTAssertEqual(switches.count, 9)

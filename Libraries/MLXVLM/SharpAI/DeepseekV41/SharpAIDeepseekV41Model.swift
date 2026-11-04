@@ -846,9 +846,7 @@ public final class DeepseekV41DecoderLayer: Module {
                 ExpertLookahead(predicted: $0.predict(collapsed), target: $0.target)
             }
         }
-        if !decoding, let promptLink, SwitchGLU.promptPipeline,
-            ExpertStreamingConfig.shared.isEnabled
-        {
+        if !decoding, let promptLink, SwitchGLU.usesPromptPipeline(tokens: collapsed.dim(1)) {
             mlp.experts.switchMLP.promptLookahead = ExpertLookahead(
                 predicted: promptLink.predict(collapsed), target: promptLink.target)
         }

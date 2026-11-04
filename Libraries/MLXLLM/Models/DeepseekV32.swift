@@ -552,6 +552,8 @@ class DeepseekV32DecoderLayer: Module {
     /// Later MoE layers, nearest first, for expert prefetch during decode
     /// (`MLX_MOE_PREFETCH_TOPK`, `MLX_MOE_PREFETCH_DEPTH`).
     var lookaheadLinks: [ExpertLookaheadLink] = []
+    /// The next MoE layer, for expert prefetch during streamed prompt chunks.
+    var promptLink: ExpertLookaheadLink?
 
     init(_ args: DeepseekV32Configuration, layerIdx: Int) {
         self._selfAttn.wrappedValue = DeepseekV32Attention(args, layerIdx: layerIdx)
@@ -584,6 +586,12 @@ class DeepseekV32DecoderLayer: Module {
             moe.switchMLP.lookahead = lookaheadLinks.map {
                 ExpertLookahead(predicted: $0.predict(h), target: $0.next.switchMLP)
             }
+        }
+        if h.dim(1) > 1, let promptLink, SwitchGLU.usesPromptPipeline(tokens: h.dim(1)),
+            let moe = mlp as? DeepseekV3MoE
+        {
+            moe.switchMLP.promptLookahead = ExpertLookahead(
+                predicted: promptLink.predict(h), target: promptLink.next.switchMLP)
         }
         let r2 = mlp(postAttentionLayerNorm(h))
         let out = h + r2
@@ -634,6 +642,15 @@ public class DeepseekV32ModelInner: Module, LayerPartitionable, StreamableMoE {
 
         let k = SwitchGLU.lookaheadTopK
         let groups = args.v3Configuration.nGroup ?? 1
+        if groups == 1 {
+            for i in layers.indices.dropLast() where layers[i].mlp is DeepseekV3MoE {
+                guard let next = layers[i + 1].mlp as? DeepseekV3MoE,
+                    let topK = SwitchGLU.promptPredictTopK ?? next.gate.topK
+                else { continue }
+                layers[i].promptLink = ExpertLookaheadLink(
+                    norm: layers[i + 1].postAttentionLayerNorm, next: next, topK: topK)
+            }
+        }
         if k > 0, groups == 1 {
             for i in layers.indices where layers[i].mlp is DeepseekV3MoE {
                 for j in i + 1 ..< min(i + 1 + SwitchGLU.lookaheadDepth, layers.count)
