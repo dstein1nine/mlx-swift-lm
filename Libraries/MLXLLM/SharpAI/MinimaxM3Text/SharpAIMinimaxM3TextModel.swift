@@ -399,3 +399,12 @@ extension SharpAIMinimaxM3TextModel: LoRAModel {
         model.layers
     }
 }
+
+extension SharpAIMinimaxM3TextModel {
+    /// The template runs thinking in "adaptive" mode with no off switch: the model opens
+    /// `<mm:think>` itself when it chooses to reason. Plain tokens, not special ones.
+    var reasoningConfig: ReasoningConfig? {
+        ReasoningConfig(
+            startDelimiter: "<mm:think>", endDelimiter: "</mm:think>", promptStrategy: .alwaysOn)
+    }
+}

@@ -91,6 +91,14 @@ final class SharpAIMinimaxM3TextRegistrationTests: XCTestCase {
         XCTAssertEqual(model.vocabularySize, 1000)
     }
 
+    /// Adaptive thinking with no off switch: `<mm:think>` is parsed on every turn.
+    func testReasoningProtocolIsAlwaysOnMiniMaxTags() throws {
+        let reasoning = try XCTUnwrap(try buildModel(tinyJSON).reasoningConfig)
+        XCTAssertEqual(reasoning.startDelimiter, "<mm:think>")
+        XCTAssertEqual(reasoning.endDelimiter, "</mm:think>")
+        XCTAssertEqual(reasoning.promptStrategy, .alwaysOn)
+    }
+
     func testMoELayersWithoutExpertCountFailAtConstruction() throws {
         let json = sparseTinyJSON.replacingOccurrences(
             of: "\"num_local_experts\": 4,", with: "")
