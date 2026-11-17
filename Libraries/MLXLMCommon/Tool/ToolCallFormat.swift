@@ -36,6 +36,10 @@ public protocol ToolCallParser: Sendable {
     /// - Returns: A `ToolCall` if parsing succeeds, `nil` otherwise
     func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall?
 
+    /// Parse every call in one complete frame, for formats that put several
+    /// calls between one start and end tag. Defaults to `parse`.
+    func parseFrame(content: String, tools: [[String: any Sendable]]?) -> [ToolCall]
+
     /// Parse remaining buffered content at end-of-sequence.
     ///
     /// Called when generation ends to extract any tool calls still in the buffer.
@@ -48,18 +52,19 @@ extension ToolCallParser {
     public var supportsBareJSON: Bool { false }
     public var supportsMarkerlessNamedJSON: Bool { false }
 
+    public func parseFrame(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        parse(content: content, tools: tools).map { [$0] } ?? []
+    }
+
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {
             return
                 toolCallBuffer
                 .components(separatedBy: startTag)
                 .filter { !$0.isEmpty }
-                .compactMap { parse(content: $0, tools: tools) }
+                .flatMap { parseFrame(content: $0, tools: tools) }
         } else {
-            guard let toolCall = parse(content: toolCallBuffer, tools: tools) else {
-                return []
-            }
-            return [toolCall]
+            return parseFrame(content: toolCallBuffer, tools: tools)
         }
     }
 }
@@ -117,6 +122,10 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
 
+    /// DeepSeek V4 DSML format; one `calls` block can hold several invokes.
+    /// Example: `<｜DSML｜ calls><｜DSML｜ invoke name="f"><｜DSML｜ parameter name="k" string="true">v</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>`
+    case deepseekDSML = "deepseek_dsml"
+
     /// Muse Glimmer's Onyx ATEM invoke/parameter format.
     /// Example: `<atem:function_calls><atem:invoke name="f">...</atem:invoke></atem:function_calls>`
     case atem
@@ -166,6 +175,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .deepseekDSML:
+            return DeepSeekDSMLToolCallParser()
         case .atem:
             return ATEMToolCallParser()
         case .mistral:
@@ -228,6 +239,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 toolCallPolicy: toolCallPolicy)
 
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+            .deepseekDSML,
             .mistral, .llama3:
             return nil
         }
@@ -250,6 +262,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         case .atem:
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+            .deepseekDSML,
             .mistral,
             .llama3:
             return []
@@ -272,6 +285,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 }
             }
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
+            .deepseekDSML,
             .mistral, .llama3:
             0
         }
@@ -326,6 +340,11 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return .gemma4
         } else if type.hasPrefix("gemma") {
             return .gemma
+        }
+
+        // DeepSeek V4 family (deepseek_v4, deepseek_v41, etc.)
+        if type.hasPrefix("deepseek_v4") {
+            return .deepseekDSML
         }
 
         // Nemotron family (nemotron_h, etc.)

@@ -10,6 +10,16 @@ public struct KimiK2ToolCallParser: ToolCallParser, Sendable {
 
     public init() {}
 
+    /// A section can hold several `<|tool_call_begin|>` calls; parse each one.
+    public func parseFrame(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        let pieces = content.components(separatedBy: "<|tool_call_begin|>")
+        guard pieces.count > 2 else {
+            return parse(content: content, tools: tools).map { [$0] } ?? []
+        }
+        let calls = pieces.dropFirst().compactMap { parse(content: $0, tools: tools) }
+        return calls.count == pieces.count - 1 ? calls : []
+    }
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         // Strip outer tags if present
         var text = content
@@ -57,6 +67,8 @@ public struct KimiK2ToolCallParser: ToolCallParser, Sendable {
             return nil
         }
 
-        return ToolCall(function: .init(name: funcName, arguments: arguments))
+        // Keep the model's own id (`functions.name:N`): the template renders it back into
+        // the history, and Kimi copies a foreign id format into its next call.
+        return ToolCall(function: .init(name: funcName, arguments: arguments), id: beforeArgBegin)
     }
 }
