@@ -246,8 +246,28 @@ class SharpAIMinimaxM3TextAttention: Module {
         return repeated(keep, count: numHeads / H, axis: 1)
     }
 
+    /// Query rows per attention pass on long sparse prompt chunks. The block mask is
+    /// `[64 heads, rows, keys]`, so whole chunks cost O(L²) memory (8K tokens: tens of GB).
+    /// Tiles append to the cache in order, so each row sees the same keys as in one pass.
+    /// `MINIMAX_ATTN_TILE=N`; 0 disables.
+    static let queryTile =
+        Int(ProcessInfo.processInfo.environment["MINIMAX_ATTN_TILE"] ?? "") ?? 1024
+
     /// - Parameter cache: `CacheList(main KV, indexer keys)` for this layer, or nil.
     func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: CacheList?
+    ) -> MLXArray {
+        let (L, tile) = (x.dim(1), Self.queryTile)
+        guard sparse != nil, cache != nil, tile > 0, L > tile, case .causal = mask else {
+            return attend(x, mask: mask, cache: cache)
+        }
+        let tiles = stride(from: 0, to: L, by: tile).map {
+            attend(x[0..., $0 ..< min($0 + tile, L)], mask: .causal, cache: cache)
+        }
+        return concatenated(tiles, axis: 1)
+    }
+
+    private func attend(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: CacheList?
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
