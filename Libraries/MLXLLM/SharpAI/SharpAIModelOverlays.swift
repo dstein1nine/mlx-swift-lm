@@ -57,6 +57,7 @@ public enum SharpAIModelOverlays {
         "longcat_flash",
         "mimo_v2",
         "minimax_m3_text",
+        "minimax_m3_vl",
         "muse_glimmer_text",
         "nemotron_h_mtp",
         "olmo_hybrid",

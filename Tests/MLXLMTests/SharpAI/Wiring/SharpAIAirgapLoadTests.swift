@@ -103,6 +103,9 @@ enum SharpAIAirgap {
         .init(key: "minimax_m3_text", json: #"""
 {"architectures":["MiniMaxM3SparseForCausalLM"],"model_type":"minimax_m3_text","hidden_size":64,"intermediate_size":128,"num_hidden_layers":2,"num_attention_heads":8,"num_key_value_heads":2,"vocab_size":1000}
 """#),
+        .init(key: "minimax_m3_vl", json: #"""
+{"architectures":["MiniMaxM3SparseForConditionalGeneration"],"model_type":"minimax_m3_vl","text_config":{"architectures":["MiniMaxM3SparseForCausalLM"],"hidden_size":64,"intermediate_size":128,"num_hidden_layers":2,"num_attention_heads":8,"num_key_value_heads":2,"vocab_size":1000}}
+"""#),
         .init(key: "muse_glimmer_text", json: #"""
 {"model_type":"muse_glimmer_text","architectures":["MuseGlimmerForCausalLM"],"vocab_size":40,"hidden_size":16,"intermediate_size":32,"num_hidden_layers":4,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"max_position_embeddings":128,"rms_norm_eps":1e-05,"post_norm_eps":1e-08,"attention_bias":false,"sliding_window":4,"qk_scale_factor":3.87,"output_multiplier":0.5,"final_logit_softcapping":20.0,"tie_word_embeddings":false,"rope_parameters":{"rope_theta":500000.0,"rope_type":"default"}}
 """#),

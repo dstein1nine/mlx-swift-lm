@@ -2,37 +2,28 @@
 //  SharpAIMinimaxM3TextModel.swift
 //  MLXLLM
 //
-//  SharpAI fork overlay: text decoder for model_type minimax_m3_text. Not part of upstream
-//  mlx-swift-lm.
+//  SharpAI fork overlay: text decoder for MiniMax M3 (model_type minimax_m3_text, and the
+//  language model of minimax_m3_vl). Not part of upstream mlx-swift-lm.
 //
-//  Pre-norm decoder. Layers before index 3 use a dense SwiGLU-OAI MLP. Later layers use a
-//  sigmoid-routed MoE: top-k is chosen on score + bias, weights come from the unbiased scores
-//  renormalized over the chosen experts, the routed sum is scaled by routed_scaling_factor, and
-//  the shared expert is added after. Attention is GQA with per-head Gemma-style qk RMSNorm and
-//  partial RoPE. A sparse layer also runs a block indexer. It max-pools query-key scores per
-//  block, always keeps the query's local block, keeps the top-k blocks per indexer head group,
-//  and intersects that block set with causal visibility.
+//  Ported from mlx-lm 0.32.2 `models/minimax_m3_vl.py`. The module tree uses the same names,
+//  so MLX checkpoints and their per-layer quantization entries map one to one.
 //
-//  Each layer keeps a CacheList(main KV, indexer key history). The indexer keys carry RoPE, so
-//  they cannot be rebuilt from the main cache.
+//  Pre-norm decoder. Dense layers (moe_layer_freq 0) use a SwiGLU-OAI MLP. MoE layers use a
+//  sigmoid router: top-k on score + bias, weights from the unbiased scores renormalized over
+//  the chosen experts and scaled by routed_scaling_factor, plus one shared expert.
+//  Attention is GQA with Gemma-style per-head qk RMSNorm and partial RoPE. A sparse layer also
+//  runs a block indexer that keeps the top-k key blocks per indexer head; it changes nothing
+//  until the context holds more than topk blocks.
 //
-//  UNVERIFIED (no M3 checkpoint run here):
-//  - Indexer RoPE covers the full index_dim, and its norms are Gemma-style. The reference
-//    summary says the cos/sin tables are sliced to 128 channels, which fits full-width RoPE.
-//  - Expert and shared-expert key layout (fused gate_up_proj vs per-expert w1/w2/w3 or
-//    gate/up/down_proj). SharpAIMinimaxM3TextSanitizer.remapCheckpoint accepts all of them.
-//  - The shared expert width is shared_intermediate_size times n_shared_experts.
-//  - The unbiased-score renormalization in the router comes from the Laguna sibling
-//    (renormalize over the chosen experts, no epsilon). It is not checked against M3.
-//  The routing, activation constants and sparse-selection rules follow the transformers
-//  minimax_m3_vl modular file and config as summarized, not as byte-level source.
+//  Each layer keeps a CacheList(main KV, indexer keys). The indexer keys carry RoPE, so they
+//  cannot be rebuilt from the main cache.
 
 import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
 
-/// Gemma-style RMSNorm: normalizes in float32 and scales by (1 + weight). The weight starts at 0.
+/// Gemma-style RMSNorm: scales by (1 + weight). The weight starts at 0.
 class SharpAIMinimaxM3TextRMSNorm: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let eps: Float
@@ -44,7 +35,7 @@ class SharpAIMinimaxM3TextRMSNorm: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: weight + 1, eps: eps).asType(x.dtype)
+        MLXFast.rmsNorm(x, weight: 1 + weight, eps: eps)
     }
 }
 
@@ -52,9 +43,9 @@ class SharpAIMinimaxM3TextRMSNorm: Module {
 func sharpAIMinimaxM3SwigluOAI(gate: MLXArray, up: MLXArray, alpha: Float, limit: Float)
     -> MLXArray
 {
-    let g = clip(gate, max: limit)
+    let g = minimum(gate, limit)
     let u = clip(up, min: -limit, max: limit)
-    return (u + 1) * (g * sigmoid(g * alpha))
+    return (u + 1) * (g * sigmoid(alpha * g))
 }
 
 /// Dense SwiGLU-OAI MLP. Used by the dense layers and by the shared expert.
@@ -81,183 +72,71 @@ class SharpAIMinimaxM3TextMLP: Module, UnaryLayer {
     }
 }
 
-/// Sigmoid router with a selection-only bias. Checkpoint keys: `mlp.gate.weight` and
-/// `mlp.gate.e_score_correction_bias`.
-class SharpAIMinimaxM3TextRouter: Module {
-    let topK: Int
-
-    @ParameterInfo(key: "weight") var weight: MLXArray
-    @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
-
-    init(hiddenSize: Int, numExperts: Int, topK: Int) {
-        self.topK = topK
-        _weight.wrappedValue = MLXArray.zeros([numExperts, hiddenSize])
-        _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([numExperts])
-        super.init()
-    }
-
-    /// Returns expert indices [B, L, topK] and renormalized unbiased sigmoid weights [B, L, topK].
-    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let logits = x.matmul(weight.T).asType(.float32)
-        let scores = sigmoid(logits)
-        let selection = scores + eScoreCorrectionBias
-        let inds = argPartition(-selection, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
-        var weights = takeAlong(scores, inds, axis: -1)
-        weights = weights / weights.sum(axis: -1, keepDims: true)
-        return (inds, weights.asType(x.dtype))
-    }
-}
-
-/// Routed experts (SwitchGLU with the SwiGLU-OAI activation) plus an optional shared expert.
+/// Routed experts plus one shared expert. Checkpoint keys: `block_sparse_moe.{gate,
+/// e_score_correction_bias, switch_mlp, shared_experts}`.
 class SharpAIMinimaxM3TextSparseMoE: Module, UnaryLayer {
-    @ModuleInfo(key: "gate") var gate: SharpAIMinimaxM3TextRouter
-    @ModuleInfo(key: "experts") var experts: SwitchGLU
-    @ModuleInfo(key: "shared_experts") var sharedExperts: SharpAIMinimaxM3TextMLP?
+    @ModuleInfo(key: "gate") var gate: Linear
+    @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
+    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "shared_experts") var sharedExperts: SharpAIMinimaxM3TextMLP
+    let topK: Int
     let routedScalingFactor: Float
 
     init(_ config: SharpAIMinimaxM3TextConfiguration) {
         let alpha = config.swigluAlpha
         let limit = config.swigluLimit
+        let numExperts = config.numLocalExperts ?? 0
+        self.topK = config.numExpertsPerTok ?? 1
         self.routedScalingFactor = config.routedScalingFactor
 
-        _gate.wrappedValue = SharpAIMinimaxM3TextRouter(
-            hiddenSize: config.hiddenSize,
-            numExperts: config.numLocalExperts ?? 0,
-            topK: config.numExpertsPerTok ?? 1)
-
-        _experts.wrappedValue = SwitchGLU(
+        _gate.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
+        _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([numExperts])
+        _switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.intermediateSize ?? 0,
-            numExperts: config.numLocalExperts ?? 0,
+            numExperts: numExperts,
             activation: { g in
-                let clamped = clip(g, max: limit)
-                return clamped * sigmoid(clamped * alpha)
+                let clamped = minimum(g, limit)
+                return clamped * sigmoid(alpha * clamped)
             },
             activationProduct: { g, u in
                 sharpAIMinimaxM3SwigluOAI(gate: g, up: u, alpha: alpha, limit: limit)
             },
             bias: false)
-
-        let sharedWidth =
-            config.numSharedExperts * (config.sharedIntermediateSize ?? config.intermediateSize ?? 0)
-        if config.numSharedExperts > 0, sharedWidth > 0 {
-            _sharedExperts.wrappedValue = SharpAIMinimaxM3TextMLP(
-                hiddenSize: config.hiddenSize, intermediateSize: sharedWidth,
-                alpha: alpha, limit: limit)
-        }
+        _sharedExperts.wrappedValue = SharpAIMinimaxM3TextMLP(
+            hiddenSize: config.hiddenSize,
+            intermediateSize: config.numSharedExperts
+                * (config.sharedIntermediateSize ?? config.intermediateSize ?? 0),
+            alpha: alpha, limit: limit)
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let (inds, weights) = gate(x)
-        let expertOutputs = experts(x, inds)
-        var routed = (expertOutputs * weights[.ellipsis, .newAxis]).sum(axis: -2)
-        routed = routed * routedScalingFactor
-        if let sharedExperts {
-            routed = routed + sharedExperts(x)
-        }
-        return routed
+        let shared = sharedExperts(x)
+
+        // Route in the weight dtype; upcast only the logits.
+        let scores = sigmoid(gate(x).asType(.float32))
+        let selection = scores + eScoreCorrectionBias
+        let inds = argPartition(-selection, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        var weights = takeAlong(scores, inds, axis: -1)
+        weights = weights / (weights.sum(axis: -1, keepDims: true) + 1e-20)
+        weights = (weights * routedScalingFactor).asType(x.dtype)
+
+        let routed = (switchMLP(x, inds) * weights[.ellipsis, .newAxis]).sum(axis: -2)
+        return routed + shared
     }
 }
 
-/// Block indexer for sparse layers. It returns, for each query, the key blocks it may attend
-/// to, one set per indexer head. The cache holds this layer's indexer key history.
-class SharpAIMinimaxM3TextIndexer: Module {
-    let numHeads: Int
-    let headDim: Int
-    let blockSize: Int
-    let topkBlocks: Int
-    let localBlocks: Int
-    let rope: RoPE
-
-    @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
-    @ModuleInfo(key: "q_norm") var qNorm: SharpAIMinimaxM3TextRMSNorm
-    @ModuleInfo(key: "k_norm") var kNorm: SharpAIMinimaxM3TextRMSNorm
-
-    init(_ config: SharpAIMinimaxM3TextConfiguration, sparse: SharpAIMinimaxM3TextSparseAttentionConfiguration) {
-        self.numHeads = sparse.indexHeads
-        self.headDim = sparse.indexDim
-        self.blockSize = sparse.blockSize
-        self.topkBlocks = sparse.topkBlocks
-        self.localBlocks = sparse.localBlocks
-        self.rope = RoPE(dimensions: sparse.indexDim, traditional: false, base: config.ropeTheta)
-
-        _qProj.wrappedValue = Linear(config.hiddenSize, sparse.indexHeads * sparse.indexDim, bias: false)
-        _kProj.wrappedValue = Linear(config.hiddenSize, sparse.indexDim, bias: false)
-        _qNorm.wrappedValue = SharpAIMinimaxM3TextRMSNorm(
-            dimensions: sparse.indexDim, eps: config.rmsNormEps)
-        _kNorm.wrappedValue = SharpAIMinimaxM3TextRMSNorm(
-            dimensions: sparse.indexDim, eps: config.rmsNormEps)
-        super.init()
-    }
-
-    /// - Returns: a boolean block mask `[B, numHeads, L, blockCount]` (true = block kept for that
-    ///   query), and the key length after this step's append (`cache offset + L`).
-    func callAsFunction(_ x: MLXArray, cache: KVCache?) -> (MLXArray, Int) {
-        let (B, L) = (x.dim(0), x.dim(1))
-
-        var q = qNorm(qProj(x).reshaped(B, L, numHeads, headDim)).transposed(0, 2, 1, 3)
-        var k = kNorm(kProj(x).reshaped(B, L, 1, headDim)).transposed(0, 2, 1, 3)
-
-        let offset = cache?.ropeOffset
-        q = applyRotaryPosition(rope, to: q, offset: offset)
-        k = applyRotaryPosition(rope, to: k, offset: offset)
-        if let cache {
-            (k, _) = cache.update(keys: k, values: MLXArray.zeros([B, 1, L, 0]))
-        }
-
-        let keyLength = k.dim(2)
-        let blockCount = (keyLength + blockSize - 1) / blockSize
-        let paddedLength = blockCount * blockSize
-        let negInf = MLXArray(-Float.infinity)
-
-        // Raw dot products, no 1/sqrt(d) scale. Future keys are masked before pooling.
-        var scores = matmul(q.asType(.float32), k.asType(.float32).transposed(0, 1, 3, 2))
-        scores = which(createCausalMask(n: L, offset: keyLength - L), scores, negInf)
-        if paddedLength > keyLength {
-            scores = padded(
-                scores,
-                widths: [
-                    .init((0, 0)), .init((0, 0)), .init((0, 0)),
-                    .init((0, paddedLength - keyLength)),
-                ],
-                value: negInf)
-        }
-        var blockScores = scores.reshaped(B, numHeads, L, blockCount, blockSize).max(axis: -1)
-
-        // Local blocks: the query's own block, then localBlocks - 1 before it (clamped at 0).
-        // They always win the selection.
-        let queryPositions = MLXArray((keyLength - L ..< keyLength).map { Int32($0) })
-        let queryBlocks = floorDivide(queryPositions, MLXArray(Int32(blockSize)))
-        let blockIndex = MLXArray((0 ..< blockCount).map { Int32($0) })
-        var isLocal = MLXArray.zeros([L, blockCount], dtype: .bool)
-        for o in 0 ..< localBlocks {
-            let target = maximum(queryBlocks - MLXArray(Int32(o)), MLXArray(Int32(0)))
-            isLocal = isLocal | (blockIndex.reshaped(1, blockCount) .== target.reshaped(L, 1))
-        }
-        blockScores = which(isLocal, MLXArray(Float.infinity), blockScores)
-
-        // Top-k blocks per query and indexer head. Blocks that are still -inf are not selected.
-        let keep = min(topkBlocks, blockCount)
-        let order = argPartition(-blockScores, kth: keep - 1, axis: -1)[.ellipsis, ..<keep]
-        let picked = takeAlong(blockScores, order, axis: -1)
-        let valid = picked .> negInf
-        // Invalid slots go to a dummy column past the last block, which is dropped below.
-        let slots = which(valid, order.asType(.int32), MLXArray(Int32(blockCount)))
-        var selected = MLXArray.zeros([B, numHeads, L, blockCount + 1], dtype: .bool)
-        selected = putAlong(selected, slots, values: MLXArray(true), axis: -1)
-        return (selected[.ellipsis, ..<blockCount], keyLength)
-    }
-}
-
-/// GQA attention with per-head qk RMSNorm, partial RoPE, and an optional block indexer.
+/// GQA attention with per-head qk RMSNorm, partial RoPE, and, on sparse layers, a block
+/// indexer whose weights sit on this module (`index_{q,k}_proj`, `index_{q,k}_norm`).
 class SharpAIMinimaxM3TextAttention: Module {
     let numHeads: Int
     let numKVHeads: Int
     let headDim: Int
     let scale: Float
     let rope: RoPE
+    let sparse: SharpAIMinimaxM3TextSparseAttentionConfiguration?
+    let indexRope: RoPE?
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -265,7 +144,10 @@ class SharpAIMinimaxM3TextAttention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: SharpAIMinimaxM3TextRMSNorm?
     @ModuleInfo(key: "k_norm") var kNorm: SharpAIMinimaxM3TextRMSNorm?
-    @ModuleInfo(key: "indexer") var indexer: SharpAIMinimaxM3TextIndexer?
+    @ModuleInfo(key: "index_q_proj") var indexQProj: Linear?
+    @ModuleInfo(key: "index_k_proj") var indexKProj: Linear?
+    @ModuleInfo(key: "index_q_norm") var indexQNorm: SharpAIMinimaxM3TextRMSNorm?
+    @ModuleInfo(key: "index_k_norm") var indexKNorm: SharpAIMinimaxM3TextRMSNorm?
 
     init(_ config: SharpAIMinimaxM3TextConfiguration, layer: Int) {
         self.numHeads = config.attentionHeads
@@ -275,15 +157,10 @@ class SharpAIMinimaxM3TextAttention: Module {
         self.rope = RoPE(
             dimensions: config.rotaryDimensions, traditional: false, base: config.ropeTheta)
 
-        _qProj.wrappedValue = Linear(
-            config.hiddenSize, numHeads * headDim, bias: false)
-        _kProj.wrappedValue = Linear(
-            config.hiddenSize, numKVHeads * headDim, bias: false)
-        _vProj.wrappedValue = Linear(
-            config.hiddenSize, numKVHeads * headDim, bias: false)
-        _oProj.wrappedValue = Linear(
-            numHeads * headDim, config.hiddenSize, bias: false)
-
+        _qProj.wrappedValue = Linear(config.hiddenSize, numHeads * headDim, bias: false)
+        _kProj.wrappedValue = Linear(config.hiddenSize, numKVHeads * headDim, bias: false)
+        _vProj.wrappedValue = Linear(config.hiddenSize, numKVHeads * headDim, bias: false)
+        _oProj.wrappedValue = Linear(numHeads * headDim, config.hiddenSize, bias: false)
         if config.useQkNorm {
             _qNorm.wrappedValue = SharpAIMinimaxM3TextRMSNorm(
                 dimensions: headDim, eps: config.rmsNormEps)
@@ -292,9 +169,81 @@ class SharpAIMinimaxM3TextAttention: Module {
         }
 
         if config.isSparseAttentionLayer(layer), let sparse = config.sparseAttention {
-            _indexer.wrappedValue = SharpAIMinimaxM3TextIndexer(config, sparse: sparse)
+            self.sparse = sparse
+            // The reference truncates the index RoPE tables to min(rotary_dim, index_dim).
+            self.indexRope = RoPE(
+                dimensions: min(config.rotaryDimensions, sparse.indexDim), traditional: false,
+                base: config.ropeTheta)
+            _indexQProj.wrappedValue = Linear(
+                config.hiddenSize, sparse.indexHeads * sparse.indexDim, bias: false)
+            _indexKProj.wrappedValue = Linear(config.hiddenSize, sparse.indexDim, bias: false)
+            _indexQNorm.wrappedValue = SharpAIMinimaxM3TextRMSNorm(
+                dimensions: sparse.indexDim, eps: config.rmsNormEps)
+            _indexKNorm.wrappedValue = SharpAIMinimaxM3TextRMSNorm(
+                dimensions: sparse.indexDim, eps: config.rmsNormEps)
+        } else {
+            self.sparse = nil
+            self.indexRope = nil
         }
         super.init()
+    }
+
+    /// Keeps only the top-k key blocks per query and indexer head, widened to every query
+    /// head of the group. Returns nil when every block fits the budget, so nothing is dropped.
+    private func blockMask(
+        _ x: MLXArray, sparse: SharpAIMinimaxM3TextSparseAttentionConfiguration,
+        offset: RoPEOffset?, cache: KVCache?
+    ) -> MLXArray? {
+        let (B, L) = (x.dim(0), x.dim(1))
+        let (H, D) = (sparse.indexHeads, sparse.indexDim)
+
+        // Cache the index keys even when no block is dropped: later steps need them.
+        var k = indexKNorm!(indexKProj!(x).reshaped(B, L, 1, D)).transposed(0, 2, 1, 3)
+        k = applyRotaryPosition(indexRope!, to: k, offset: offset)
+        if let cache {
+            (k, _) = cache.update(keys: k, values: MLXArray.zeros([B, 1, L, 0], dtype: k.dtype))
+        }
+
+        let blockSize = sparse.blockSize
+        let topk = sparse.topkBlocks
+        let keyCount = k.dim(2)
+        let fullBlocks = keyCount / blockSize
+        let tailKeys = keyCount % blockSize
+        let blockCount = fullBlocks + (tailKeys > 0 ? 1 : 0)
+        if topk >= blockCount { return nil }
+
+        var q = indexQNorm!(indexQProj!(x).reshaped(B, L, H, D)).transposed(0, 2, 1, 3)
+        q = applyRotaryPosition(indexRope!, to: q, offset: offset)
+
+        // Blocks are cut over cache slots, so queries are placed by slot.
+        let qpos = MLXArray((keyCount - L ..< keyCount).map { Int32($0) })
+        let causal =
+            MLXArray((0 ..< keyCount).map { Int32($0) }).reshaped(1, keyCount)
+            .<= qpos.reshaped(L, 1)
+        var scores = matmul(q.asType(.float32), k.asType(.float32).transposed(0, 1, 3, 2))
+        // A future key must not win a block, so mask before pooling.
+        scores = which(causal, scores, MLXArray(-Float.infinity))
+        let split = fullBlocks * blockSize
+        var blockScores = scores[.ellipsis, ..<split]
+            .reshaped(B, H, L, fullBlocks, blockSize).max(axis: -1)
+        if tailKeys > 0 {
+            let tail = scores[.ellipsis, split...].max(axis: -1, keepDims: true)
+            blockScores = concatenated([blockScores, tail], axis: -1)
+        }
+        if sparse.localBlocks > 0 {
+            let qBlock = floorDivide(qpos, MLXArray(Int32(blockSize))).reshaped(L, 1)
+            let ids = MLXArray((0 ..< blockCount).map { Int32($0) }).reshaped(1, blockCount)
+            let isLocal = (ids .<= qBlock) & (ids .> qBlock - MLXArray(Int32(sparse.localBlocks)))
+            blockScores = which(isLocal, MLXArray(Float.infinity), blockScores)
+        }
+
+        let inds = argPartition(-blockScores, kth: topk - 1, axis: -1)[.ellipsis, ..<topk]
+        var keep = putAlong(
+            MLXArray.zeros(blockScores.shape, dtype: .bool), inds, values: MLXArray(true),
+            axis: -1)
+        // A kept block still holds future keys, so mask again.
+        keep = repeated(keep, count: blockSize, axis: -1)[.ellipsis, ..<keyCount] & causal
+        return repeated(keep, count: numHeads / H, axis: 1)
     }
 
     /// - Parameter cache: `CacheList(main KV, indexer keys)` for this layer, or nil.
@@ -303,64 +252,45 @@ class SharpAIMinimaxM3TextAttention: Module {
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         let mainCache = cache?[0]
+        let offset = mainCache?.ropeOffset
 
         var queries = qProj(x).reshaped(B, L, numHeads, headDim)
         var keys = kProj(x).reshaped(B, L, numKVHeads, headDim)
-        var values = vProj(x).reshaped(B, L, numKVHeads, headDim)
+        let values = vProj(x).reshaped(B, L, numKVHeads, headDim).transposed(0, 2, 1, 3)
         if let qNorm, let kNorm {
             queries = qNorm(queries)
             keys = kNorm(keys)
         }
-        queries = queries.transposed(0, 2, 1, 3)
-        keys = keys.transposed(0, 2, 1, 3)
-        values = values.transposed(0, 2, 1, 3)
-
-        let offset = mainCache?.ropeOffset
-        queries = applyRotaryPosition(rope, to: queries, offset: offset)
-        keys = applyRotaryPosition(rope, to: keys, offset: offset)
+        queries = applyRotaryPosition(rope, to: queries.transposed(0, 2, 1, 3), offset: offset)
+        keys = applyRotaryPosition(rope, to: keys.transposed(0, 2, 1, 3), offset: offset)
 
         var attentionMask = mask
-        if let indexer {
-            // The indexer appends to its own cache first. Its key length equals the main
-            // cache's offset plus L, so the block mask is sized for the main attention below.
-            let (blockMask, keyLength) = indexer(x, cache: cache?[1])
-            let blockOfKey = MLXArray((0 ..< keyLength).map { Int32($0 / indexer.blockSize) })
-            let keyVisible = take(blockMask, blockOfKey, axis: -1)
-            let causal = createCausalMask(n: L, offset: keyLength - L)
-                .reshaped(1, 1, L, keyLength)
-            let visible = keyVisible & causal
-            // Query heads in one KV group share one indexer head.
-            attentionMask = .array(
-                repeated(visible, count: numHeads / indexer.numHeads, axis: 1))
+        if let sparse, let block = blockMask(x, sparse: sparse, offset: offset, cache: cache?[1]) {
+            attentionMask = .array(block)
         }
 
         let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: mainCache,
-            scale: scale,
+            queries: queries, keys: keys, values: values, cache: mainCache, scale: scale,
             mask: attentionMask
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
-
         return oProj(output)
     }
 }
 
 class SharpAIMinimaxM3TextDecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: SharpAIMinimaxM3TextAttention
-    @ModuleInfo(key: "mlp") var mlp: Module & UnaryLayer
+    @ModuleInfo(key: "block_sparse_moe") var moe: SharpAIMinimaxM3TextSparseMoE?
+    @ModuleInfo(key: "mlp") var mlp: SharpAIMinimaxM3TextMLP?
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: SharpAIMinimaxM3TextRMSNorm
     @ModuleInfo(key: "post_attention_layernorm")
     var postAttentionLayerNorm: SharpAIMinimaxM3TextRMSNorm
 
     init(_ config: SharpAIMinimaxM3TextConfiguration, layer: Int) {
         _selfAttn.wrappedValue = SharpAIMinimaxM3TextAttention(config, layer: layer)
-
         if config.isMoELayer(layer) {
-            _mlp.wrappedValue = SharpAIMinimaxM3TextSparseMoE(config)
+            _moe.wrappedValue = SharpAIMinimaxM3TextSparseMoE(config)
         } else {
             _mlp.wrappedValue = SharpAIMinimaxM3TextMLP(
                 hiddenSize: config.hiddenSize,
@@ -368,7 +298,6 @@ class SharpAIMinimaxM3TextDecoderLayer: Module {
                 alpha: config.swigluAlpha,
                 limit: config.swigluLimit)
         }
-
         _inputLayerNorm.wrappedValue = SharpAIMinimaxM3TextRMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         _postAttentionLayerNorm.wrappedValue = SharpAIMinimaxM3TextRMSNorm(
@@ -380,12 +309,18 @@ class SharpAIMinimaxM3TextDecoderLayer: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: CacheList?
     ) -> MLXArray {
         let h = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        return h + mlp(postAttentionLayerNorm(h))
+        let normed = postAttentionLayerNorm(h)
+        if let moe {
+            return h + moe(normed)
+        }
+        return h + mlp!(normed)
     }
 }
 
-class SharpAIMinimaxM3TextInner: Module {
+class SharpAIMinimaxM3TextInner: Module, StreamableMoE {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    /// SSD streaming happens inside SwitchGLU; this flag only tells the server it applies.
+    var streamExperts = false
     let layers: [SharpAIMinimaxM3TextDecoderLayer]
     let norm: SharpAIMinimaxM3TextRMSNorm
 
@@ -402,7 +337,6 @@ class SharpAIMinimaxM3TextInner: Module {
 
     func callAsFunction(_ inputs: MLXArray, cache: [CacheList]?) -> MLXArray {
         var h = embedTokens(inputs)
-        // Dense layers take this mask. Sparse layers build their own from the block selection.
         let mask = createAttentionMask(h: h, cache: cache?.first?[0])
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
@@ -416,7 +350,6 @@ class SharpAIMinimaxM3TextModel: Module, LLMModel {
     let kvHeads: [Int]
     let configuration: SharpAIMinimaxM3TextConfiguration
     let model: SharpAIMinimaxM3TextInner
-
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     init(_ configuration: SharpAIMinimaxM3TextConfiguration) {
@@ -424,7 +357,6 @@ class SharpAIMinimaxM3TextModel: Module, LLMModel {
         self.vocabularySize = configuration.vocabularySize
         self.kvHeads = Array(repeating: configuration.kvHeads, count: configuration.hiddenLayers)
         self.model = SharpAIMinimaxM3TextInner(configuration)
-
         if !configuration.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(
                 configuration.hiddenSize, configuration.vocabularySize, bias: false)
@@ -440,8 +372,8 @@ class SharpAIMinimaxM3TextModel: Module, LLMModel {
         return model.embedTokens.asLinear(out)
     }
 
-    /// One `CacheList(main, indexer)` per layer. Each child is a `KVCacheSimple`. Bounded
-    /// (rotating) caches are not supported here, so `maxKVSize` is ignored.
+    /// One `CacheList(main, indexer)` per layer. Bounded (rotating) caches are not supported,
+    /// so `maxKVSize` is ignored.
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
         (0 ..< configuration.hiddenLayers).map { _ -> KVCache in
             CacheList(KVCacheSimple(), KVCacheSimple())

@@ -65,6 +65,7 @@ final class SharpAIMinimaxM3VlRegistrationTests: XCTestCase {
         }
     }
 
+    /// unsupportedModelType makes SwiftLM fall back to the text model.
     func testValidConfigStopsAtConstructionAsUnsupported() throws {
         guard let creator = SharpAIMinimaxM3VlOverlay.creators["minimax_m3_vl"] else {
             XCTFail("minimax_m3_vl creator missing")
@@ -74,10 +75,10 @@ final class SharpAIMinimaxM3VlRegistrationTests: XCTestCase {
         XCTAssertThrowsError(
             try creator(Data(SharpAIMinimaxM3VlFixtures.tinyJSON.utf8))
         ) { error in
-            guard let typed = error as? SharpAIMinimaxM3VlError,
-                case .unsupported = typed
+            guard let typed = error as? ModelFactoryError,
+                case .unsupportedModelType = typed
             else {
-                XCTFail("expected unsupported, got \(error)")
+                XCTFail("expected unsupportedModelType, got \(error)")
                 return
             }
         }

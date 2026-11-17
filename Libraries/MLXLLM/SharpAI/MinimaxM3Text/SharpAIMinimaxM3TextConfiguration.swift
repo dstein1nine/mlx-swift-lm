@@ -169,7 +169,10 @@ public struct SharpAIMinimaxM3TextConfiguration: Decodable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        modelType = try container.decode(String.self, forKey: .modelType)
+        // minimax_m3_vl's text_config carries no model_type.
+        modelType =
+            try container.decodeIfPresent(String.self, forKey: .modelType)
+            ?? Self.expectedModelType
         architectures =
             try container.decodeIfPresent([String].self, forKey: .architectures) ?? []
         hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)

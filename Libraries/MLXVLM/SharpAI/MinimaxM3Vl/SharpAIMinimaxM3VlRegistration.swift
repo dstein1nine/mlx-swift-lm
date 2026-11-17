@@ -2,8 +2,8 @@
 //
 // Creators use the same closure shape as VLMTypeRegistry: decode, validate, construct.
 // VLMModelFactory is not edited. A consumer merges these creators into its registry.
-// The construct step throws: the vision tower and the block-sparse attention are not
-// implemented, and no M3 model source exists in this repo, vLLM, or mlx-lm on this machine.
+// The construct step throws: the vision tower is not implemented. It throws
+// unsupportedModelType so SwiftLM falls back to the text model (minimax_m3_text overlay).
 
 import Foundation
 import MLXLMCommon
@@ -16,8 +16,8 @@ public enum SharpAIMinimaxM3VlOverlay {
             let configuration = try JSONDecoder.json5().decode(
                 SharpAIMinimaxM3VlConfiguration.self, from: data)
             try configuration.validateModelConfiguration()
-            throw SharpAIMinimaxM3VlError.unsupported(
-                "vision tower and block-sparse attention are not implemented")
+            throw ModelFactoryError.unsupportedModelType(
+                "minimax_m3_vl: the vision tower is not implemented; load it as a text model")
         }
     ]
 }
