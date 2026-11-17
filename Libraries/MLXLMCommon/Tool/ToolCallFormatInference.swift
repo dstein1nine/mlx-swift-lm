@@ -38,6 +38,8 @@ extension ToolCallFormat {
     /// would reroute the whole response protocol rather than one payload shape.
     private static let signatures: [Signature] = [
         Signature(.minimaxM2, allOf: "<minimax:tool_call>"),
+        // The template joins the prefix and tag at render time, so match them apart.
+        Signature(.minimaxM3, allOf: "]<]minimax[>[", "<tool_call>"),
         Signature(.deepseekDSML, allOf: "｜DSML｜ calls>"),
         Signature(.gemma4, allOf: "<|tool_call>", "<tool_call|>"),
         Signature(.gemma, allOf: "<start_function_call>"),
@@ -65,6 +67,7 @@ extension ToolCallFormat {
     public init?(toolParserType name: String) {
         switch name.lowercased() {
         case "minimax_m2": self = .minimaxM2
+        case "minimax_m3": self = .minimaxM3
         case "deepseek_dsml", "deepseek_v4": self = .deepseekDSML
         case "gemma4": self = .gemma4
         case "function_gemma", "gemma": self = .gemma

@@ -122,6 +122,10 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
 
+    /// MiniMax M3 format: every tag carries the `]<]minimax[>[` prefix; one block can hold several invokes.
+    /// Example: `]<]minimax[>[<tool_call>]<]minimax[>[<invoke name="f">]<]minimax[>[<k>v]<]minimax[>[</k>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>`
+    case minimaxM3 = "minimax_m3"
+
     /// DeepSeek V4 DSML format; one `calls` block can hold several invokes.
     /// Example: `<｜DSML｜ calls><｜DSML｜ invoke name="f"><｜DSML｜ parameter name="k" string="true">v</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>`
     case deepseekDSML = "deepseek_dsml"
@@ -175,6 +179,8 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .minimaxM3:
+            return MiniMaxM3ToolCallParser()
         case .deepseekDSML:
             return DeepSeekDSMLToolCallParser()
         case .atem:
@@ -239,7 +245,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 toolCallPolicy: toolCallPolicy)
 
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
-            .deepseekDSML,
+            .minimaxM3, .deepseekDSML,
             .mistral, .llama3:
             return nil
         }
@@ -262,7 +268,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         case .atem:
             return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
-            .deepseekDSML,
+            .minimaxM3, .deepseekDSML,
             .mistral,
             .llama3:
             return []
@@ -285,7 +291,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
                 }
             }
         case .json, .lfm2, .xmlFunction, .qwen35, .glm4, .gemma, .gemma4, .kimiK2, .minimaxM2,
-            .deepseekDSML,
+            .minimaxM3, .deepseekDSML,
             .mistral, .llama3:
             0
         }
@@ -340,6 +346,11 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
             return .gemma4
         } else if type.hasPrefix("gemma") {
             return .gemma
+        }
+
+        // MiniMax M3 family (minimax_m3_vl, minimax_m3_text)
+        if type.hasPrefix("minimax_m3") {
+            return .minimaxM3
         }
 
         // DeepSeek V4 family (deepseek_v4, deepseek_v41, etc.)
