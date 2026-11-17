@@ -532,6 +532,15 @@ public func loadWeights(
         }
     }
 
+    // NVFP4 experts with a per-expert global scale (mlx-lm sets global_scale=True the same way).
+    for (path, module) in model.namedModules() {
+        if let switchLinear = module as? QuantizedSwitchLinear,
+            weights["\(path).global_scale"] != nil
+        {
+            switchLinear.expectGlobalScale()
+        }
+    }
+
     // Extract weight_scale_inv for switch_mlp layers BEFORE update to avoid Unhandled Keys
     var stackedScales = [String: MLXArray]()
     for key in weights.keys {

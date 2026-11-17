@@ -293,6 +293,15 @@ open class SwitchGLU: Module, @unchecked Sendable {
         let v = ProcessInfo.processInfo.environment["MLX_MOE_FUSE_GATEUP"] ?? ""
         return v == "1" || v.lowercased() == "true"
     }()
+    /// The fused mode runs gate and up as one matmul with one global scale per slot, so it
+    /// cannot serve NVFP4 experts, whose gate and up each carry their own per-expert scale.
+    private var fusesGateUp: Bool {
+        guard SwitchGLU.useFusedGateUp else { return false }
+        let hasGlobalScale = [gateProj, upProj].contains {
+            ($0 as? QuantizedSwitchLinear)?.globalScale != nil
+        }
+        return !hasGlobalScale
+    }
     private var _stackedGateUp: MLXArray?
     // Pre-concatenated gate+up scales/biases along the intermediate axis,
     // computed once at cold init so the runtime `MLX.take` is a single op.
@@ -354,7 +363,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
         endPromptPipeline()
 
         let CACHE_SLOTS = SwitchGLU.MAX_CACHE_SLOTS
-        let isFused = SwitchGLU.useFusedGateUp
+        let isFused = fusesGateUp
 
         if _stackedGate == nil && _stackedGateUp == nil {
             // Each file slab must fill exactly one slot, or reads land in the wrong place.
@@ -532,7 +541,7 @@ open class SwitchGLU: Module, @unchecked Sendable {
         guard budget > 0 else { return }
         let targets = table.claim(experts, reserved: held, limit: budget)
         guard !targets.isEmpty else { return }
-        let isFused = SwitchGLU.useFusedGateUp
+        let isFused = fusesGateUp
         let jobsPerExpert = targets.map { placementJobs([$0], isFused: isFused) }
         let pending = PendingPrefetch(targets)
         SwitchGLU.prefetchQueue.async {
@@ -1777,6 +1786,8 @@ open class SwitchLinear: Module, Quantizable {
 open class QuantizedSwitchLinear: SwitchLinear, Quantized {
     @ModuleInfo(key: "scales") var scales: MLXArray
     @ModuleInfo(key: "biases") var biases: MLXArray?
+    /// NVFP4 tensor scale per expert, `[numExperts]` float32; nil for other modes.
+    @ParameterInfo(key: "global_scale") public var globalScale: MLXArray?
 
     public let groupSize: Int
     public let bits: Int
@@ -1799,6 +1810,15 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
             weight: quantizedWeight, bias: other.bias)
 
         self.freeze()
+    }
+
+    /// Gives the global scale a placeholder so `update(parameters:)` can load the checkpoint's.
+    func expectGlobalScale() {
+        if globalScale == nil {
+            _globalScale.wrappedValue = MLXArray.zeros([numExperts], dtype: .float32)
+            // Module caches its items; an empty module update rebuilds the cache.
+            _ = try? update(modules: ModuleChildren(), verify: .none)
+        }
     }
 
     override open func callAsFunction(
@@ -1856,7 +1876,8 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
                         rangeX, buffers[i],
                         scales: expertScales, biases: expertBiases,
                         rhsIndices: expertIndices, transpose: true,
-                        groupSize: self.groupSize, bits: self.bits, mode: mode, sortedIndices: true
+                        groupSize: self.groupSize, bits: self.bits, mode: mode,
+                        globalScale: globalScale?[r.id ..< r.id + 1], sortedIndices: true
                     )
                     if let bias = self.bias {
                         let biasSlice = bias[r.id ..< r.id + 1]
@@ -1884,7 +1905,8 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
                         rangeX, w,
                         scales: expertScales, biases: expertBiases,
                         rhsIndices: expertIndices, transpose: true,
-                        groupSize: self.groupSize, bits: self.bits, mode: mode, sortedIndices: true
+                        groupSize: self.groupSize, bits: self.bits, mode: mode,
+                        globalScale: globalScale?[r.id ..< r.id + 1], sortedIndices: true
                     )
                     if let bias = self.bias {
                         let biasSlice = bias[r.id ..< r.id + 1]
@@ -1935,6 +1957,7 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
             groupSize: self.groupSize,
             bits: self.bits,
             mode: mode,
+            globalScale: globalScale,
             sortedIndices: sortedIndices
         )
 
@@ -1976,7 +1999,8 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
                 rangeX, buffers[i],
                 scales: expertScales, biases: expertBiases,
                 rhsIndices: expertIndices, transpose: true,
-                groupSize: self.groupSize, bits: self.bits, mode: mode, sortedIndices: true
+                groupSize: self.groupSize, bits: self.bits, mode: mode,
+                globalScale: globalScale?[r.id ..< r.id + 1], sortedIndices: true
             )
             if let bias = self.bias {
                 let biasSlice = bias[r.id ..< r.id + 1]
@@ -2031,7 +2055,9 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
             biases: stackedBiases,
             rhsIndices: slotPerToken,
             transpose: true,
-            groupSize: self.groupSize, bits: self.bits, mode: mode, sortedIndices: false
+            groupSize: self.groupSize, bits: self.bits, mode: mode,
+            globalScale: globalScale.map { MLX.take($0, slotExpertsMLX, axis: 0) },
+            sortedIndices: false
         )
 
         // Optional per-token bias add (gathered from per-slot bias).
