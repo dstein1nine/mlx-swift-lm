@@ -286,6 +286,8 @@ class SharpAIMinimaxM3TextDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: SharpAIMinimaxM3TextRMSNorm
     @ModuleInfo(key: "post_attention_layernorm")
     var postAttentionLayerNorm: SharpAIMinimaxM3TextRMSNorm
+    /// The next MoE layer, for expert prefetch during streamed prompt chunks.
+    var promptLink: SharpAIMinimaxM3TextPromptLink?
 
     init(_ config: SharpAIMinimaxM3TextConfiguration, layer: Int) {
         _selfAttn.wrappedValue = SharpAIMinimaxM3TextAttention(config, layer: layer)
@@ -310,10 +312,33 @@ class SharpAIMinimaxM3TextDecoderLayer: Module {
     ) -> MLXArray {
         let h = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let normed = postAttentionLayerNorm(h)
+        if let moe, let promptLink, SwitchGLU.usesPromptPipeline(tokens: h.dim(1)) {
+            moe.switchMLP.promptLookahead = ExpertLookahead(
+                predicted: promptLink.predict(h), target: promptLink.next.switchMLP)
+        }
         if let moe {
             return h + moe(normed)
         }
         return h + mlp!(normed)
+    }
+}
+
+/// Guesses the next MoE layer's experts by running its router on this layer's
+/// post-attention hidden state, so their reads overlap this layer's compute.
+final class SharpAIMinimaxM3TextPromptLink {
+    let norm: SharpAIMinimaxM3TextRMSNorm
+    let next: SharpAIMinimaxM3TextSparseMoE
+    let topK: Int
+
+    init(norm: SharpAIMinimaxM3TextRMSNorm, next: SharpAIMinimaxM3TextSparseMoE, topK: Int) {
+        self.norm = norm
+        self.next = next
+        self.topK = topK
+    }
+
+    func predict(_ h: MLXArray) -> MLXArray {
+        let scores = sigmoid(next.gate(norm(h)).asType(.float32)) + next.eScoreCorrectionBias
+        return argPartition(-scores, kth: topK - 1, axis: -1)[.ellipsis, ..<topK].flattened()
     }
 }
 
@@ -333,6 +358,12 @@ class SharpAIMinimaxM3TextInner: Module, StreamableMoE {
         self.norm = SharpAIMinimaxM3TextRMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         super.init()
+        for i in layers.indices.dropLast() where layers[i].moe != nil {
+            guard let next = layers[i + 1].moe else { continue }
+            layers[i].promptLink = SharpAIMinimaxM3TextPromptLink(
+                norm: layers[i + 1].postAttentionLayerNorm, next: next,
+                topK: SwitchGLU.promptPredictTopK ?? next.topK)
+        }
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [CacheList]?) -> MLXArray {
